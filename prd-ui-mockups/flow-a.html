@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>流程 A · 新建监控主题（含失败/无数据）</title>
+  <style>
+    :root {
+      --ink: #1a2332;
+      --muted: #5f6f82;
+      --line: #94a3b4;
+      --box: #ffffff;
+      --start: #e8f5f0;
+      --process: #ffffff;
+      --decision: #fff7e8;
+      --fail: #fdecec;
+      --ok: #e8f5f0;
+      --accent: #1f6b5c;
+      --fail-ink: #a33b3b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background:
+        linear-gradient(#eef2f6 1px, transparent 1px),
+        linear-gradient(90deg, #eef2f6 1px, transparent 1px),
+        #f7f9fb;
+      background-size: 24px 24px;
+      padding: 28px 16px 48px;
+    }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    .sub { margin: 0 0 24px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    .flow { display: flex; flex-direction: column; align-items: center; gap: 0; }
+    .node {
+      width: min(420px, 92vw);
+      background: var(--box);
+      border: 2px solid var(--ink);
+      border-radius: 10px;
+      padding: 14px 16px;
+      text-align: center;
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1.45;
+      position: relative;
+      z-index: 1;
+    }
+    .node--start, .node--end {
+      width: 140px;
+      border-radius: 999px;
+      background: var(--start);
+    }
+    .node--decision {
+      width: 210px;
+      min-height: 88px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--decision);
+      transform: rotate(0deg);
+      clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+      border: none;
+      padding: 28px 36px;
+      box-shadow: inset 0 0 0 2px var(--ink);
+    }
+    .node--decision span { display: block; max-width: 120px; }
+    .node--fail { background: var(--fail); border-color: var(--fail-ink); color: var(--fail-ink); }
+    .node--ok { background: var(--ok); }
+    .arrow {
+      width: 2px;
+      height: 28px;
+      background: var(--line);
+      position: relative;
+    }
+    .arrow::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      bottom: -1px;
+      transform: translateX(-50%);
+      border-left: 6px solid transparent;
+      border-right: 6px solid transparent;
+      border-top: 8px solid var(--line);
+    }
+    .label {
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 700;
+      margin: 2px 0;
+    }
+    .branch {
+      width: min(640px, 96vw);
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      align-items: start;
+      margin-top: 8px;
+      position: relative;
+    }
+    .branch::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 50%;
+      width: 70%;
+      height: 2px;
+      background: var(--line);
+      transform: translateX(-50%);
+    }
+    .col {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0;
+      padding-top: 0;
+    }
+    .col .drop {
+      width: 2px;
+      height: 20px;
+      background: var(--line);
+      margin-bottom: 0;
+    }
+    .col .drop::after {
+      content: "";
+      display: block;
+      width: 0;
+      margin: 12px auto 0;
+      border-left: 6px solid transparent;
+      border-right: 6px solid transparent;
+      border-top: 8px solid var(--line);
+    }
+    .tag {
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+    .tag--no { color: var(--fail-ink); background: #fdecec; }
+    .tag--yes { color: var(--accent); background: #e8f5f0; }
+    .merge-note {
+      margin-top: 18px;
+      width: min(520px, 94vw);
+      background: #fff;
+      border: 1px dashed var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .hl { color: var(--fail-ink); font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>流程 A · 新建监控主题</h1>
+    <p class="sub">在你现有主路径上，把「失败 / 无数据」接在<strong>开始采集之后</strong>：先问采集是否成功有数据，再决定进工作台还是提示后改条件。</p>
+
+    <div class="flow">
+      <div class="node node--start">开始</div>
+      <div class="arrow"></div>
+      <div class="node">新建主题</div>
+      <div class="arrow"></div>
+      <div class="node">空对话 / 示例话术</div>
+      <div class="arrow"></div>
+      <div class="node">用户自然语言描述</div>
+      <div class="arrow"></div>
+      <div class="node">Agent 解析并展示参数卡片<br /><span style="font-weight:500;font-size:13px;color:#5f6f82">主题 / 来源 / 周期 / 焦点</span></div>
+      <div class="arrow"></div>
+      <div class="label">参数是否确认？</div>
+      <div class="node node--decision"><span>确认？</span></div>
+
+      <div class="branch">
+        <div class="col">
+          <div class="drop"></div>
+          <div class="tag tag--no">否</div>
+          <div class="node">用户修改参数<br /><span style="font-weight:500;font-size:13px;color:#5f6f82">对话改口或点「修改条件」</span></div>
+          <div class="arrow"></div>
+          <div class="node" style="font-size:13px;font-weight:500;color:#5f6f82">回到「参数卡片」重新确认 ↑</div>
+        </div>
+        <div class="col">
+          <div class="drop"></div>
+          <div class="tag tag--yes">是</div>
+          <div class="node">开始采集</div>
+          <div class="arrow"></div>
+          <div class="label">采集结果？</div>
+          <div class="node node--decision"><span>成功且<br />有数据？</span></div>
+        </div>
+      </div>
+
+      <!-- 第二层分支：只挂在右侧「是」路径下，用说明+并排展示 -->
+      <div style="width:min(640px,96vw); margin-top:12px; display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+        <div class="col">
+          <div class="tag tag--no">否 · 失败 / 无数据</div>
+          <div class="node node--fail">中文提示失败或暂无数据<br /><span style="font-weight:500;font-size:13px">禁止展示报错代码</span></div>
+          <div class="arrow"></div>
+          <div class="node">引导用户修改条件后重试<br /><span style="font-weight:500;font-size:13px;color:#5f6f82">回到参数卡片或继续对话</span></div>
+        </div>
+        <div class="col">
+          <div class="tag tag--yes">是 · 成功有数据</div>
+          <div class="node node--ok">右侧洞察更新</div>
+          <div class="arrow"></div>
+          <div class="node node--ok">进入主题工作台</div>
+          <div class="arrow"></div>
+          <div class="node node--end">结束</div>
+        </div>
+      </div>
+
+      <div class="merge-note">
+        <strong>怎么接到你那张图上：</strong>在「开始采集」和「右侧洞察更新」之间，插入菱形
+        <span class="hl">「成功且有数据？」</span>。
+        <br />是 → 右侧洞察更新 → 工作台 → 结束；
+        否 → 中文提示 → 改条件重试（回到参数卡片），不要直接连到结束。
+      </div>
+    </div>
+  </div>
+</body>
+</html>
