@@ -153,6 +153,22 @@ function setModule(mod) {
   render();
 }
 
+/** 切换监测主题。resetView=true 时强制回数据列表；否则保留 list/insight/manage */
+function switchMonitorTopic(topicId, resetView = false) {
+  if (!topicId) return;
+  state.topicId = topicId;
+  state.module = "monitor";
+  if (resetView || state.monitorView === "create") {
+    state.monitorView = "list";
+  }
+  if (state.monitorView === "insight") {
+    state.sixdimScope = "topic:" + state.topicId;
+    state.sixdimData = state.sixdimCache[state.sixdimScope] || null;
+    loadMetrics();
+  }
+  render();
+}
+
 function openPlanCreate(seedText) {
   state.module = "monitor";
   state.monitorView = "create";
@@ -1909,19 +1925,6 @@ function bind() {
     });
   });
 
-  document.querySelectorAll("[data-topic]").forEach((el) => {
-    if (el.dataset.jumpList !== undefined) return;
-    el.addEventListener("click", () => {
-      if (!el.dataset.topic) return;
-      if (el.closest(".sider") || el.closest(".attn-list")) {
-        state.topicId = el.dataset.topic;
-        state.monitorView = "list";
-        if (state.module !== "monitor") setModule("monitor");
-        else render();
-      }
-    });
-  });
-
   document.querySelectorAll("[data-view]").forEach((btn) => {
     btn.addEventListener("click", () => {
       state.monitorView = btn.dataset.view;
@@ -2098,13 +2101,7 @@ function bind() {
     });
   });
 
-  document.querySelectorAll("[data-jump-list]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      state.topicId = btn.dataset.topic;
-      state.monitorView = "list";
-      render();
-    });
-  });
+  // data-jump-list / 侧栏主题切换：见下方 #shell 事件委托
   document.querySelectorAll("[data-edit-topic]").forEach((btn) => {
     btn.addEventListener("click", () => toast(`演示：编辑主题「${btn.dataset.editTopic}」`));
   });
@@ -2344,6 +2341,24 @@ $("#topnav").addEventListener("click", (e) => {
   const btn = e.target.closest("[data-module]");
   if (!btn) return;
   setModule(btn.dataset.module);
+});
+
+// 主题切换用事件委托（#shell 节点不销毁，避免每次 render 重绑失败/缓存旧逻辑）
+$("#shell").addEventListener("click", (e) => {
+  const jump = e.target.closest("[data-jump-list]");
+  if (jump && jump.dataset.topic) {
+    switchMonitorTopic(jump.dataset.topic, true);
+    return;
+  }
+  const topicEl = e.target.closest("[data-topic]");
+  if (!topicEl || !topicEl.dataset.topic) return;
+  if (topicEl.dataset.jumpList !== undefined) return;
+  // 工作台「需关注」→ 数据列表；左侧「我的主题」→ 保留当前子视图
+  if (topicEl.closest(".attn-list")) {
+    switchMonitorTopic(topicEl.dataset.topic, true);
+  } else if (topicEl.closest(".sider")) {
+    switchMonitorTopic(topicEl.dataset.topic, false);
+  }
 });
 
 render();
