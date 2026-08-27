@@ -11,7 +11,7 @@ API:
   /api/articles?topic&media&sentiment&q&limit   文章列表
   /api/hot                   热词榜
   /api/assistant?q           智能助手（规则分析数据）
-  /api/themes POST           保存新建监测主题
+  /api/themes POST           保存或更新监测主题
   /api/plan-route POST       应对方案模板规则推荐（需六维）
   /api/plan POST             按已确认模板生成应对方案/分型报告
 """
@@ -19,6 +19,7 @@ import os
 import sys
 import json
 import re
+import copy
 import datetime as dt
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -128,6 +129,7 @@ THEMES = [
     {"id": "t_hot", "name": "全网热搜", "keywords": [], "source_only": "baidu_hot",
      "meta": "百度热搜 · 运行中", "status": "运行中"},
 ]
+THEMES_BUILTIN = copy.deepcopy(THEMES)
 
 SRC_NAME = {"it_home": "IT之家", "sspai": "少数派", "baidu_hot": "百度热搜",
              "ifanr": "爱范儿", "geekpark": "极客公园", "leiphone": "雷锋网",
@@ -196,41 +198,153 @@ def _recompute():
     return _sentiment_snapshot()
 
 
-def _load_custom_themes():
-    """加载 themes.json 的自定义主题，合并到 THEMES（运行时参与匹配）。"""
-    global THEMES
-    if not os.path.exists(THEMES_FILE):
-        return
-    try:
-        with open(THEMES_FILE, encoding="utf-8-sig") as f:
-            customs = json.load(f)
-    except Exception:
-        return
-    base = [t for t in THEMES if str(t["id"]).startswith("t_")]
-    idx = 1
-    for c in customs:
-        name = (c.get("name") or "").strip()
-        keywords = (c.get("keywords") or "").strip()
-        if not name:
-            continue
-        if any(t["name"] == name for t in base):
-            continue
-        theme = {"id": f"c_{idx}", "name": name, "keywords": [],
-                 "meta": f"{c.get('group') or '自定义'} · 运行中", "status": "运行中"}
-        # 识别数据源别名（如"微博热搜"→按 weibo_hot 数据源监测）
+def _split_kws(val):
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    s = (val or "").strip()
+    if not s:
+        return []
+    return [x for x in re.split(r"[\s+|/]+", s) if x]
+
+
+def _apply_theme_record(theme, rec):
+    """用 themes.json 一条记录覆盖主题字段。"""
+    if rec.get("name"):
+        theme["name"] = rec["name"].strip()
+    if "keywords" in rec:
+        theme["keywords"] = _split_kws(rec.get("keywords"))
+        blob = (theme.get("name") or "") + " " + " ".join(theme["keywords"])
         matched_src = None
         for alias, src in SRC_ALIAS.items():
-            if alias.lower() in name.lower() or alias.lower() in keywords.lower():
+            if alias.lower() in blob.lower():
                 matched_src = src
                 break
         if matched_src:
             theme["source_only"] = matched_src
             theme["meta"] = f"{SRC_NAME.get(matched_src, matched_src)} · 运行中"
         else:
-            theme["keywords"] = re.split(r"[\s+|/]+", keywords)
-        base.append(theme)
-        idx += 1
-    THEMES = base
+            builtin = next((t for t in THEMES_BUILTIN if t["id"] == theme.get("id")), None)
+            if builtin and builtin.get("source_only"):
+                theme["source_only"] = builtin["source_only"]
+            else:
+                theme.pop("source_only", None)
+    if "exclude" in rec:
+        theme["exclude"] = _split_kws(rec.get("exclude"))
+    group = (rec.get("group") or "").strip()
+    if group:
+        theme["group"] = group
+        theme["meta"] = f"{group} · {theme.get('status') or '运行中'}"
+    if "alert" in rec:
+        theme["alert"] = bool(rec.get("alert"))
+    return theme
+
+
+def _new_theme_from_record(rec, tid):
+    theme = {
+        "id": tid,
+        "name": (rec.get("name") or "").strip() or "未命名",
+        "keywords": [],
+        "exclude": [],
+        "meta": f"{rec.get('group') or '自定义'} · 运行中",
+        "status": "运行中",
+        "group": rec.get("group") or "自定义",
+    }
+    return _apply_theme_record(theme, rec)
+
+
+def _load_custom_themes():
+    """从 themes.json 覆盖内置主题、合并自定义主题。"""
+    global THEMES
+    base = copy.deepcopy(THEMES_BUILTIN)
+    by_id = {t["id"]: t for t in base}
+    if not os.path.exists(THEMES_FILE):
+        THEMES = base
+        return
+    try:
+        with open(THEMES_FILE, encoding="utf-8-sig") as f:
+            customs = json.load(f)
+    except Exception:
+        THEMES = base
+        return
+    if not isinstance(customs, list):
+        THEMES = base
+        return
+    extra = []
+    for c in customs:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("id") or "").strip()
+        name = (c.get("name") or "").strip()
+        if cid and cid in by_id:
+            _apply_theme_record(by_id[cid], c)
+            continue
+        if not name:
+            continue
+        if any(t["name"] == name for t in base) and not cid:
+            continue
+        tid = cid if cid.startswith("c_") else f"c_{len(extra) + 1}"
+        extra.append(_new_theme_from_record(c, tid))
+    THEMES = list(by_id.values()) + extra
+
+
+def _read_themes_file():
+    if not os.path.exists(THEMES_FILE):
+        return []
+    try:
+        with open(THEMES_FILE, encoding="utf-8-sig") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _write_themes_file(rows):
+    folder = os.path.dirname(THEMES_FILE)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(THEMES_FILE, "w", encoding="utf-8-sig") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
+
+def _save_theme(body):
+    """新建或更新监测主题，写入 themes.json 后重新装载。"""
+    name = (body.get("name") or "").strip()
+    keywords = body.get("keywords") if body.get("keywords") is not None else ""
+    if isinstance(keywords, list):
+        keywords = "|".join(str(x) for x in keywords if str(x).strip())
+    keywords = str(keywords).strip()
+    if not name:
+        return {"ok": False, "error": "请填写方案名称"}
+    tid = str(body.get("id") or "").strip()
+    rec = {
+        "name": name,
+        "group": (body.get("group") or "").strip() or "自定义",
+        "keywords": keywords,
+        "exclude": (body.get("exclude") or "").strip(),
+        "alert": bool(body.get("alert")),
+        "update_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    rows = _read_themes_file()
+    if tid:
+        rec["id"] = tid
+        found = False
+        for i, r in enumerate(rows):
+            if str(r.get("id") or "") == tid:
+                rec["create_time"] = r.get("create_time") or rec["update_time"]
+                rows[i] = rec
+                found = True
+                break
+        if not found:
+            rec["create_time"] = rec["update_time"]
+            rows.append(rec)
+    else:
+        rec["id"] = "c_" + dt.datetime.now().strftime("%Y%m%d%H%M%S")
+        rec["create_time"] = rec["update_time"]
+        rows.append(rec)
+        tid = rec["id"]
+    _write_themes_file(rows)
+    _load_custom_themes()
+    return {"ok": True, "id": tid}
 
 
 def _load():
@@ -285,6 +399,9 @@ def _rel_time(t):
 
 def _match_theme(theme, row):
     text = (row.get("title") or "") + " " + (row.get("content") or "")[:200]
+    for ex in theme.get("exclude") or []:
+        if ex and ex.lower() in text.lower():
+            return False
     if theme.get("source_only"):
         return row["source"] == theme["source_only"]
     return any(kw.lower() in text.lower() for kw in theme["keywords"])
@@ -766,15 +883,10 @@ class Handler(SimpleHTTPRequestHandler):
             if urlparse(self.path).path == "/api/themes":
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or "{}")
-                themes = []
-                if os.path.exists(THEMES_FILE):
-                    with open(THEMES_FILE, encoding="utf-8-sig") as f:
-                        themes = json.load(f)
-                themes.append({**body, "create_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-                with open(THEMES_FILE, "w", encoding="utf-8-sig") as f:
-                    json.dump(themes, f, ensure_ascii=False)
-                _load_custom_themes()  # 保存后立即生效
-                return self._json({"code": 0, "data": {"ok": True}})
+                saved = _save_theme(body)
+                if not saved.get("ok"):
+                    return self._json({"code": 1, "data": saved, "msg": saved.get("error") or "保存失败"})
+                return self._json({"code": 0, "data": saved})
             return self._json({"code": 404, "msg": "not found"}, 404)
         except Exception as e:
             print(f"[server] POST 处理异常：{e}")

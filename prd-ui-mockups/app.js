@@ -17,6 +17,7 @@ const state = {
   assistMessages: [],
   modal: null,
   planForm: emptyPlanForm(),
+  editingTopicId: null,
   planChat: [],
   eventForm: emptyEventForm(),
   eventChat: [],
@@ -97,6 +98,10 @@ async function loadData() {
       meta: `${t.count} 条 · ${t.status}`,
       status: t.status,
       keywords: t.keywords || [],
+      exclude: t.exclude || [],
+      group: t.group || ((t.meta || "").split("·")[0] || "").trim(),
+      source_only: t.source_only || "",
+      alert: !!t.alert,
     }));
     articles = ar.data || [];
     hotWords = hot.data || [];
@@ -167,6 +172,7 @@ function switchMonitorTopic(topicId, resetView = false) {
   state.module = "monitor";
   if (resetView || state.monitorView === "create") {
     state.monitorView = "list";
+    state.editingTopicId = null;
   }
   if (state.monitorView === "insight") {
     state.sixdimScope = "topic:" + state.topicId;
@@ -179,6 +185,7 @@ function switchMonitorTopic(topicId, resetView = false) {
 function openPlanCreate(seedText) {
   state.module = "monitor";
   state.monitorView = "create";
+  state.editingTopicId = null;
   state.planForm = emptyPlanForm();
   state.planChat = [];
   if (seedText) {
@@ -189,6 +196,40 @@ function openPlanCreate(seedText) {
       html: `<p>已根据你的描述填写左侧监测方案表单。可直接改字段，或继续告诉我要改哪一项。</p>`,
     });
   }
+  render();
+}
+
+function joinTopicWords(val) {
+  if (Array.isArray(val)) return val.filter(Boolean).join("|");
+  return val || "";
+}
+
+function openPlanEdit(topicId) {
+  const t = topics.find((x) => x.id === topicId);
+  if (!t) {
+    toast("未找到该主题");
+    return;
+  }
+  const groups = ["中国文化", "汽车产业", "科技数码", "国际经贸"];
+  let group = t.group || "";
+  if (group && !groups.includes(group)) {
+    if (/汽车|新能源/.test(group)) group = "汽车产业";
+    else if (/科技|数码|热搜/.test(group)) group = "科技数码";
+    else group = "科技数码";
+  }
+  state.module = "monitor";
+  state.monitorView = "create";
+  state.editingTopicId = topicId;
+  state.topicId = topicId;
+  state.planForm = {
+    ...emptyPlanForm(),
+    name: t.name || "",
+    group: group || "科技数码",
+    keywords: joinTopicWords(t.keywords) || (t.source_only ? t.name : ""),
+    exclude: joinTopicWords(t.exclude),
+    alert: !!t.alert,
+  };
+  state.planChat = [];
   render();
 }
 
@@ -586,21 +627,24 @@ function renderMonitor() {
 function renderPlanCreate() {
   const f = state.planForm;
   const emptyChat = !state.planChat.length;
+  const editing = !!state.editingTopicId;
   return `
   <main class="main main--plan">
-    <div class="plan-banner">什么是监测方案：监测方案是与您相关或您关注的词条；通过设置词条，系统将把互联网中相关信息第一时间汇总给您。新手可先在右侧告诉助手需求，由表单自动填写。</div>
+    <div class="plan-banner">${editing
+      ? "正在编辑已有监测主题。左侧已带入当前名称与关键词，修改后点保存即可覆盖原方案。"
+      : "什么是监测方案：监测方案是与您相关或您关注的词条；通过设置词条，系统将把互联网中相关信息第一时间汇总给您。新手可先在右侧告诉助手需求，由表单自动填写。"}</div>
     <div class="plan-layout">
       <section class="panel plan-form-panel">
         <header class="panel__head">
-          <h3>高级创建</h3>
-          <span class="muted">当前是高级创建，可设置关键词组合</span>
+          <h3>${editing ? "编辑监测主题" : "高级创建"}</h3>
+          <span class="muted">${editing ? "与新建同一张表，保存后更新该主题" : "当前是高级创建，可设置关键词组合"}</span>
         </header>
         <div class="plan-form" data-scroll-key="plan-form">
           <div class="plan-row">
             <label>方案名称</label>
             <div class="plan-field">
-              <input id="plan-name" maxlength="6" placeholder="请输入方案名称" value="${escapeHtml(f.name)}" />
-              <span class="plan-hint">*方案名称控制在 6 字符以内</span>
+              <input id="plan-name" maxlength="20" placeholder="请输入方案名称" value="${escapeHtml(f.name)}" />
+              <span class="plan-hint">*方案名称控制在 20 字符以内</span>
             </div>
           </div>
           <div class="plan-row">
@@ -2188,22 +2232,31 @@ function bind() {
     planSave.onclick = async () => {
       syncPlanFormFromDom();
       const f = state.planForm;
+      const editing = topics.find((x) => x.id === state.editingTopicId);
       if (!f.name) return toast("请填写方案名称");
-      if (!f.keywords) return toast("请填写主体关键词");
+      if (!f.keywords && !(editing && editing.source_only)) return toast("请填写主体关键词");
       try {
-        await fetch("/api/themes", {
+        const r = await fetch("/api/themes", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            id: state.editingTopicId || undefined,
             name: f.name, group: f.group, keywords: f.keywords,
             exclude: f.exclude, alert: f.alert,
           }),
-        });
-        await loadData(); // 重新拉取主题与文章（用后端分配的主题 id）
+        }).then((x) => x.json());
+        const d = r.data || {};
+        if (r.code !== 0 && !d.ok) {
+          toast(d.error || r.msg || "保存失败");
+          return;
+        }
+        const savedId = d.id || state.editingTopicId;
+        await loadData();
+        state.editingTopicId = null;
         state.monitorView = "list";
-        const nt = topics.find((t) => t.name === f.name);
+        const nt = topics.find((t) => t.id === savedId) || topics.find((t) => t.name === f.name);
         if (nt) state.topicId = nt.id;
-        toast("监测方案已保存");
+        toast(editing ? "监测主题已更新" : "监测方案已保存");
       } catch (e) {
         toast("保存失败：数据服务未运行");
       }
@@ -2213,6 +2266,7 @@ function bind() {
   const planCancel = $("#btn-plan-cancel");
   if (planCancel) {
     planCancel.onclick = () => {
+      state.editingTopicId = null;
       state.monitorView = "list";
       render();
     };
@@ -2279,7 +2333,7 @@ function bind() {
 
   // data-jump-list / 侧栏主题切换：见下方 #shell 事件委托
   document.querySelectorAll("[data-edit-topic]").forEach((btn) => {
-    btn.addEventListener("click", () => toast(`演示：编辑主题「${btn.dataset.editTopic}」`));
+    btn.addEventListener("click", () => openPlanEdit(btn.dataset.editTopic));
   });
 
   const btnNewEvent = $("#btn-new-event");
