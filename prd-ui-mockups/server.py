@@ -12,6 +12,8 @@ API:
   /api/hot                   热词榜
   /api/assistant?q           智能助手（规则分析数据）
   /api/themes POST           保存新建监测主题
+  /api/plan-route POST       应对方案模板规则推荐（需六维）
+  /api/plan POST             按已确认模板生成应对方案/分型报告
 """
 import os
 import sys
@@ -533,6 +535,35 @@ def _insight_emotion():
     return res
 
 
+def _sample_feed_from_rows(rows):
+    """分层采样：负面/正面/中性各取若干，带上来源供模型引用。"""
+    ordered = sorted(rows, key=lambda r: r.get("publish_time") or dt.datetime.min)
+    neg = [r for r in ordered if r.get("sentiment_label") == "负面"]
+    pos = [r for r in ordered if r.get("sentiment_label") == "正面"]
+    neu = [r for r in ordered if r.get("sentiment_label") == "中性"]
+    sample = (neg[-12:] + pos[-8:] + neu[-12:])
+    sample.sort(key=lambda r: r.get("publish_time") or dt.datetime.min)
+    return [{
+        "title": r.get("title"),
+        "content": r.get("content"),
+        "publish_time": str(r.get("publish_time") or ""),
+        "source": SRC_NAME.get(r.get("source"), r.get("source") or ""),
+        "sentiment": {"label": r.get("sentiment_label", "中性")},
+    } for r in sample]
+
+
+def _metrics_text(scope=None):
+    m = _metrics(scope)
+    emo = m["emotion"]
+    return (
+        f"舆情总量 {m['total']} 条；"
+        f"情感分布：正面 {emo['pos']} 条（{emo['pos_ratio']}%）、中性 {emo['neu']} 条（{emo['neu_ratio']}%）、"
+        f"负面 {emo['neg']} 条（{emo['neg_ratio']}%）；"
+        f"来源构成：" + "、".join(f"{s['source']} {s['count']} 条" for s in m["source"]) + "；"
+        f"近7天声量：" + "、".join(f"{t['date']} {t['count']} 条" for t in m["trend"]) + "。"
+    )
+
+
 def _insight_sixdim(scope=None):
     """调用 LLM 对当前范围（主题/事件）文章做「六维舆情分析」。"""
     if not _insight:
@@ -542,19 +573,7 @@ def _insight_sixdim(scope=None):
     scoped = _scope_rows(scope)
     if not scoped:
         return {"available": False, "error": "当前主题/事件下暂无舆情数据，无法生成六维分析"}
-    rows = sorted(scoped, key=lambda r: r.get("publish_time") or dt.datetime.min)
-    # 分层采样：负面/正面/中性各取若干，保证归纳覆盖不同情感
-    neg = [r for r in rows if r.get("sentiment_label") == "负面"]
-    pos = [r for r in rows if r.get("sentiment_label") == "正面"]
-    neu = [r for r in rows if r.get("sentiment_label") == "中性"]
-    sample = (neg[-12:] + pos[-8:] + neu[-12:])
-    sample.sort(key=lambda r: r.get("publish_time") or dt.datetime.min)
-    feed = [{
-        "title": r.get("title"),
-        "content": r.get("content"),
-        "publish_time": str(r.get("publish_time") or ""),
-        "sentiment": {"label": r.get("sentiment_label", "中性")},
-    } for r in sample]
+    feed = _sample_feed_from_rows(scoped)
     res = _insight.summarize_sixdimensions(feed, retries=2)
     if res.get("six_dimensions"):
         print("[insight-sixdim] 六维分析成功")
@@ -572,33 +591,53 @@ def _gen_report(scope=None):
     scoped = _scope_rows(scope)
     if not scoped:
         return {"available": False, "error": "当前主题/事件下暂无舆情数据，无法生成报告"}
-    m = _metrics(scope)
-    emo = m["emotion"]
-    metrics_text = (
-        f"舆情总量 {m['total']} 条；"
-        f"情感分布：正面 {emo['pos']} 条（{emo['pos_ratio']}%）、中性 {emo['neu']} 条（{emo['neu_ratio']}%）、"
-        f"负面 {emo['neg']} 条（{emo['neg_ratio']}%）；"
-        f"来源构成：" + "、".join(f"{s['source']} {s['count']} 条" for s in m["source"]) + "；"
-        f"近7天声量：" + "、".join(f"{t['date']} {t['count']} 条" for t in m["trend"]) + "。"
-    )
-    # 分层采样条目（负面/正面/中性）
-    rows = sorted(scoped, key=lambda r: r.get("publish_time") or dt.datetime.min)
-    neg = [r for r in rows if r.get("sentiment_label") == "负面"]
-    pos = [r for r in rows if r.get("sentiment_label") == "正面"]
-    neu = [r for r in rows if r.get("sentiment_label") == "中性"]
-    sample = (neg[-12:] + pos[-8:] + neu[-12:])
-    sample.sort(key=lambda r: r.get("publish_time") or dt.datetime.min)
-    feed = [{
-        "title": r.get("title"),
-        "content": r.get("content"),
-        "publish_time": str(r.get("publish_time") or ""),
-        "sentiment": {"label": r.get("sentiment_label", "中性")},
-    } for r in sample]
+    metrics_text = _metrics_text(scope)
+    feed = _sample_feed_from_rows(scoped)
     res = _insight.generate_report(metrics_text, feed, retries=1)
     if res.get("report"):
         print("[report] 报告生成成功")
     else:
         print(f"[report] 报告生成失败：{res.get('error')}")
+    return res
+
+
+def _plan_route(scope=None, sixdim=None, topic_name=""):
+    """规则推荐应对方案模板（不调用大模型）。"""
+    if not _insight:
+        return {"available": False, "error": "insight_llm 模块未加载"}
+    if not sixdim:
+        return {"available": False, "error": "请先生成六维分析"}
+    metrics = _metrics(scope)
+    route = _insight.route_plan_template(metrics, sixdim, scope=scope or "", topic_name=topic_name or "")
+    route["available"] = True
+    route["hint"] = (
+        "三种模板都是应对方案（分析约三成）。当前不像突发；要写战时处置请改选危机模板。详细数据请用研判报告。"
+        if route.get("template_id") != "crisis"
+        else "危机应对方案须确认后才生成，结果须人工复核后对外使用"
+    )
+    return route
+
+
+def _gen_plan(scope=None, template_id="", sixdim=None, topic_name=""):
+    """按用户确认的模板生成应对方案/分型报告。"""
+    if not _insight:
+        return {"available": False, "error": "insight_llm 模块未加载"}
+    if not os.environ.get("LLM_API_KEY"):
+        return {"available": False, "error": "未配置大模型，请在设置页填写 LLM 的 API Key"}
+    if not sixdim:
+        return {"available": False, "error": "请先生成六维分析"}
+    scoped = _scope_rows(scope)
+    if not scoped:
+        return {"available": False, "error": "当前主题/事件下暂无舆情数据，无法生成方案"}
+    feed = _sample_feed_from_rows(scoped)
+    res = _insight.generate_plan(
+        template_id, _metrics_text(scope), sixdim, feed,
+        topic_name=topic_name or "", retries=1,
+    )
+    if res.get("plan"):
+        print(f"[plan] 方案生成成功 template={template_id}")
+    else:
+        print(f"[plan] 方案生成失败：{res.get('error')}")
     return res
 
 
@@ -708,6 +747,17 @@ class Handler(SimpleHTTPRequestHandler):
             if urlparse(self.path).path == "/api/report":
                 qs = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
                 return self._json({"code": 0, "data": _gen_report(qs.get("scope"))})
+            if urlparse(self.path).path == "/api/plan-route":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or "{}")
+                return self._json({"code": 0, "data": _plan_route(
+                    body.get("scope"), body.get("six_dimensions"), body.get("topic_name") or "")})
+            if urlparse(self.path).path == "/api/plan":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or "{}")
+                return self._json({"code": 0, "data": _gen_plan(
+                    body.get("scope"), body.get("template_id") or "",
+                    body.get("six_dimensions"), body.get("topic_name") or "")})
             if urlparse(self.path).path == "/api/config":
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or "{}")

@@ -34,6 +34,8 @@ const state = {
   reportData: null, // 舆情研判分析报告（markdown）
   reportLoading: false,
   reportCache: {}, // 各 scope 的报告缓存（区分生成/查看/重新生成）
+  planCache: {}, // 各 scope 的应对方案 { md, templateId, title }
+  planLoading: false,
 };
 
 function emptyEventForm() {
@@ -156,6 +158,11 @@ function setModule(mod) {
 /** 切换监测主题。resetView=true 时强制回数据列表；否则保留 list/insight/manage */
 function switchMonitorTopic(topicId, resetView = false) {
   if (!topicId) return;
+  if (state.sixdimLoading) {
+    if (topicId === state.topicId && state.module === "monitor") return;
+    toast("六维分析生成中，请稍候再切换主题");
+    return;
+  }
   state.topicId = topicId;
   state.module = "monitor";
   if (resetView || state.monitorView === "create") {
@@ -473,12 +480,13 @@ function renderMonitor() {
     <button type="button" class="sider__btn secondary" id="btn-assist-topic">用智能助手配置</button>
     <div class="sider__title">我的主题</div>
     ${topics
-      .map(
-        (t) => `<button type="button" class="sider-item ${t.id === state.topicId ? "is-active" : ""}" data-topic="${t.id}">
+      .map((t) => {
+        const locked = state.sixdimLoading && t.id !== state.topicId;
+        return `<button type="button" class="sider-item ${t.id === state.topicId ? "is-active" : ""} ${locked ? "is-disabled" : ""}" data-topic="${t.id}" ${locked ? 'aria-disabled="true" title="六维分析生成中，请稍候再切换"' : ""}>
         <div class="sider-item__name">${escapeHtml(t.name)}</div>
         <div class="sider-item__meta">${escapeHtml(t.meta)}</div>
-      </button>`
-      )
+      </button>`;
+      })
       .join("")}
   </aside>
   <main class="main">
@@ -1102,7 +1110,7 @@ function mdToHtml(md) {
   return html;
 }
 
-function openReportLoading() {
+function openReportLoading(title, hint) {
   const old = document.getElementById("modal");
   if (old) old.remove();
   const wrap = document.createElement("div");
@@ -1110,19 +1118,20 @@ function openReportLoading() {
   wrap.id = "modal";
   wrap.innerHTML = `
     <div class="modal modal--report">
-      <h3>舆情研判分析报告</h3>
+      <h3>${escapeHtml(title || "舆情研判分析报告")}</h3>
       <div class="report-loading">
         <div class="spinner"></div>
-        <p>正在调用大模型生成报告…</p>
-        <p class="muted">完整 8 段报告通常需要 1~2 分钟，请耐心等待，不要关闭页面。</p>
+        <p>正在调用大模型生成…</p>
+        <p class="muted">${escapeHtml(hint || "完整文档通常需要数十秒至 1~2 分钟，请耐心等待，不要关闭页面。")}</p>
       </div>
     </div>`;
   document.body.appendChild(wrap);
   wrap.addEventListener("click", (e) => { if (e.target === wrap) wrap.remove(); });
 }
 
-function _reportHtml(md) {
-  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>舆情研判分析报告</title>
+function _reportHtml(md, title) {
+  const docTitle = title || "舆情研判分析报告";
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>${docTitle}</title>
   <style>
     body { font-family: "Microsoft YaHei", "PingFang SC", "SimSun", sans-serif; line-height: 1.8; padding: 40px; max-width: 820px; margin: 0 auto; color: #1f2937; }
     h2 { font-size: 20px; border-bottom: 2px solid #1f6b5c; padding-bottom: 6px; margin-top: 28px; }
@@ -1133,11 +1142,11 @@ function _reportHtml(md) {
   </style></head><body>${mdToHtml(md)}</body></html>`;
 }
 
-function exportReportPdf(md) {
+function exportReportPdf(md, title) {
   try {
     const w = window.open("", "_blank");
     if (!w) { toast("请允许浏览器弹窗后重试"); return; }
-    w.document.write(_reportHtml(md));
+    w.document.write(_reportHtml(md, title));
     w.document.close();
     w.focus();
     setTimeout(() => { w.print(); }, 400);
@@ -1147,15 +1156,16 @@ function exportReportPdf(md) {
   }
 }
 
-function exportReportWord(md) {
+function exportReportWord(md, title) {
   try {
     const scopeName = (state.sixdimScope || "all").replace(/[:]/g, "_");
-    const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8"><title>舆情研判分析报告</title></head><body>${mdToHtml(md)}</body></html>`;
+    const docTitle = title || "舆情研判分析报告";
+    const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8"><title>${docTitle}</title></head><body>${mdToHtml(md)}</body></html>`;
     const blob = new Blob(["\ufeff" + html], { type: "application/msword" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `舆情研判分析报告_${scopeName}_${new Date().toISOString().slice(0, 10)}.doc`;
+    a.download = `${docTitle}_${scopeName}_${new Date().toISOString().slice(0, 10)}.doc`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1166,7 +1176,9 @@ function exportReportWord(md) {
   }
 }
 
-function openReportModal(md) {
+function openReportModal(md, opts) {
+  opts = opts || {};
+  const title = opts.title || "舆情研判分析报告";
   const old = document.getElementById("modal");
   if (old) old.remove();
   const wrap = document.createElement("div");
@@ -1174,7 +1186,7 @@ function openReportModal(md) {
   wrap.id = "modal";
   wrap.innerHTML = `
     <div class="modal modal--report">
-      <h3>舆情研判分析报告</h3>
+      <h3>${escapeHtml(title)}</h3>
       <div class="report-content">${mdToHtml(md)}</div>
       <div class="modal__actions">
         <button type="button" class="btn-secondary" id="btn-report-copy">复制全文</button>
@@ -1190,15 +1202,19 @@ function openReportModal(md) {
   });
   const copyBtn = wrap.querySelector("#btn-report-copy");
   if (copyBtn) copyBtn.onclick = () => {
-    if (navigator.clipboard) navigator.clipboard.writeText(md).then(() => toast("已复制报告全文"));
+    if (navigator.clipboard) navigator.clipboard.writeText(md).then(() => toast(opts.copyLabel || "已复制报告全文"));
     else toast("复制失败：浏览器不支持");
   };
   const pdfBtn = wrap.querySelector("#btn-report-pdf");
-  if (pdfBtn) pdfBtn.onclick = () => exportReportPdf(md);
+  if (pdfBtn) pdfBtn.onclick = () => exportReportPdf(md, title);
   const wordBtn = wrap.querySelector("#btn-report-word");
-  if (wordBtn) wordBtn.onclick = () => exportReportWord(md);
+  if (wordBtn) wordBtn.onclick = () => exportReportWord(md, title);
   const regenBtn = wrap.querySelector("#btn-report-regen");
-  if (regenBtn) regenBtn.onclick = () => { wrap.remove(); generateReport(); };
+  if (regenBtn) regenBtn.onclick = () => {
+    wrap.remove();
+    if (opts.onRegen) opts.onRegen();
+    else generateReport();
+  };
 }
 
 function viewReport() {
@@ -1235,18 +1251,169 @@ async function generateReport() {
   state.reportLoading = false;
 }
 
+const PLAN_OPTIONS = [
+  { id: "daily", name: "日常/定期舆情应对方案", desc: "本周必做、苗头处置与升级准则（分析不超过三成）" },
+  { id: "compete", name: "市场竞争格局应对方案", desc: "对标结论 + 反制清单与分情景预案（高风险须确认）" },
+  { id: "crisis", name: "突发事件舆情应对方案", desc: "处置清单、分情景预案与沟通准则（高风险，确认后才生成）" },
+];
+
+function currentScopeName() {
+  if (state.module === "event") {
+    const ev = events.find((e) => e.id === state.eventId);
+    return ev ? ev.name : "事件分析";
+  }
+  const t = currentTopic();
+  return t ? t.name : "未命名主题";
+}
+
+function viewPlan() {
+  if (state.sixdimLoading) {
+    toast("六维分析生成中，请稍候再生成应对方案");
+    return;
+  }
+  const scope = state.sixdimScope || "all";
+  const cached = state.planCache[scope];
+  if (cached && cached.md && !state.sixdimData) {
+    openPlanDoc(cached);
+    return;
+  }
+  if (!state.sixdimData) {
+    toast("请先生成六维分析");
+    return;
+  }
+  if (cached && cached.md) openPlanDoc(cached);
+  else startPlanFlow();
+}
+
+async function startPlanFlow() {
+  if (!state.sixdimData) {
+    toast("请先生成六维分析");
+    return;
+  }
+  try {
+    const r = await fetch("/api/plan-route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scope: state.sixdimScope || "",
+        six_dimensions: state.sixdimData,
+        topic_name: currentScopeName(),
+      }),
+    }).then((x) => x.json());
+    const d = r.data || {};
+    if (!d.template_id) {
+      toast("模板推荐失败：" + (d.error || r.msg || "未知原因"));
+      return;
+    }
+    openPlanConfirm(d);
+  } catch (e) {
+    toast("模板推荐失败：数据服务未运行");
+  }
+}
+
+function openPlanConfirm(route) {
+  const old = document.getElementById("modal");
+  if (old) old.remove();
+  const recommended = route.template_id || "daily";
+  const reasons = (route.reasons || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("");
+  const hint = route.template_id === "crisis"
+    ? (route.hint || "危机模板须确认后才生成，生成结果须人工复核后对外使用")
+    : (route.hint || "当前不像突发，若要写处置方案请改选危机模板");
+  const options = PLAN_OPTIONS.map((o) => `
+    <label class="plan-template-item">
+      <input type="radio" name="plan-tpl" value="${o.id}" ${o.id === recommended ? "checked" : ""} />
+      <div>
+        <strong>${escapeHtml(o.name)}${o.id === recommended ? " · 规则推荐" : ""}</strong>
+        <span>${escapeHtml(o.desc)}</span>
+      </div>
+    </label>`).join("");
+  const wrap = document.createElement("div");
+  wrap.className = "modal-mask";
+  wrap.id = "modal";
+  wrap.innerHTML = `
+    <div class="modal modal--plan-confirm">
+      <h3>选择应对方案模板</h3>
+      <p>规则推荐「${escapeHtml(route.title || recommended)}」。请确认后再生成；详细数据分析请用「生成研判报告」。</p>
+      <ul class="plan-reasons">${reasons}</ul>
+      <p class="plan-confirm-hint">${escapeHtml(hint)}</p>
+      <div class="plan-template-list">${options}</div>
+      <div class="modal__actions">
+        <button type="button" class="btn-secondary" data-close-modal>取消</button>
+        <button type="button" class="btn-primary" id="btn-plan-confirm">确认并生成</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  wrap.addEventListener("click", (e) => {
+    if (e.target === wrap || e.target.matches("[data-close-modal]")) wrap.remove();
+  });
+  const ok = wrap.querySelector("#btn-plan-confirm");
+  if (ok) ok.onclick = () => {
+    const picked = wrap.querySelector("input[name='plan-tpl']:checked");
+    const tid = picked ? picked.value : recommended;
+    wrap.remove();
+    generatePlan(tid);
+  };
+}
+
+function openPlanDoc(rec) {
+  openReportModal(rec.md, {
+    title: rec.title || "应对方案",
+    copyLabel: "已复制全文",
+    onRegen: startPlanFlow,
+  });
+}
+
+async function generatePlan(templateId) {
+  state.planLoading = true;
+  const meta = PLAN_OPTIONS.find((x) => x.id === templateId);
+  const title = meta ? meta.name : "应对方案";
+  openReportLoading(title, "按已确认模板生成，约需数十秒至一两分钟，请勿关闭页面。");
+  try {
+    const scopeKey = state.sixdimScope || "all";
+    const r = await fetch("/api/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scope: state.sixdimScope || "",
+        template_id: templateId,
+        six_dimensions: state.sixdimData,
+        topic_name: currentScopeName(),
+      }),
+    }).then((x) => x.json());
+    const d = r.data || {};
+    const plan = d.plan || null;
+    if (plan) {
+      const rec = { md: plan, templateId: d.template_id || templateId, title: d.title || title };
+      state.planCache[scopeKey] = rec;
+      openPlanDoc(rec);
+      toast("应对方案已生成，请人工复核后再对外使用");
+    } else {
+      const old = document.getElementById("modal");
+      if (old) old.remove();
+      toast("方案生成失败：" + (d.error || r.msg || "未知原因"));
+    }
+  } catch (e) {
+    const old = document.getElementById("modal");
+    if (old) old.remove();
+    toast("方案生成失败：数据服务未运行");
+  }
+  state.planLoading = false;
+}
+
 async function generateSixdim() {
+  const requestScope = state.sixdimScope;
   state.sixdimLoading = true;
   state.sixdimData = null;
   render();
   toast("正在调用大模型生成六维分析，约需数十秒…");
   try {
-    const scope = state.sixdimScope ? "?scope=" + encodeURIComponent(state.sixdimScope) : "";
+    const scope = requestScope ? "?scope=" + encodeURIComponent(requestScope) : "";
     const r = await fetch("/api/insight-sixdim" + scope, { method: "POST" }).then((r) => r.json());
     const d = r.data || {};
-    state.sixdimData = d.six_dimensions || null;
-    if (state.sixdimData) {
-      state.sixdimCache[state.sixdimScope] = state.sixdimData; // 缓存，切换页面不丢
+    const result = d.six_dimensions || null;
+    if (result) {
+      state.sixdimCache[requestScope] = result; // 缓存，切换页面不丢
+      if (state.sixdimScope === requestScope) state.sixdimData = result;
       toast("六维分析已生成");
     } else {
       const err = d.error || r.msg || (r.code ? `接口返回 code=${r.code}` : "未知原因");
@@ -1353,7 +1520,11 @@ function renderSixLayerInsight(scopeName, mode) {
       </div>
       <div class="cockpit__actions">
         <button type="button" class="btn btn--secondary" id="btn-insight-export">${state.reportCache[state.sixdimScope || "all"] ? "查看研判报告" : "生成研判报告"}</button>
-        <button type="button" class="btn btn--primary" id="btn-insight-plan">生成应对方案</button>
+        <button type="button" class="btn btn--primary" id="btn-insight-plan"${
+          state.sixdimLoading || (!state.sixdimData && !(state.planCache[state.sixdimScope || "all"] && state.planCache[state.sixdimScope || "all"].md))
+            ? ' disabled title="请先生成六维分析"'
+            : ""
+        }>${state.planCache[state.sixdimScope || "all"] && state.planCache[state.sixdimScope || "all"].md ? "查看应对方案" : "生成应对方案"}</button>
       </div>
     </div>
 
@@ -1375,12 +1546,13 @@ function renderEventResult() {
     <button type="button" class="sider__btn secondary" id="btn-event-list">← 返回列表</button>
     <div class="sider__title">任务</div>
     ${events
-      .map(
-        (e) => `<button type="button" class="sider-item ${e.id === ev.id ? "is-active" : ""}" data-open-event="${e.id}">
+      .map((e) => {
+        const locked = state.sixdimLoading && e.id !== ev.id;
+        return `<button type="button" class="sider-item ${e.id === ev.id ? "is-active" : ""} ${locked ? "is-disabled" : ""}" data-open-event="${e.id}" ${locked ? 'aria-disabled="true" title="六维分析生成中，请稍候再切换"' : ""}>
         <div class="sider-item__name">${escapeHtml(e.name)}</div>
         <div class="sider-item__meta">${escapeHtml(e.status)}</div>
-      </button>`
-      )
+      </button>`;
+      })
       .join("")}
   </aside>
   <main class="main">
@@ -1920,6 +2092,10 @@ function openModal(type) {
 function bind() {
   document.querySelectorAll("[data-go]").forEach((el) => {
     el.addEventListener("click", () => {
+      if (state.sixdimLoading && el.dataset.topic && el.dataset.topic !== state.topicId) {
+        toast("六维分析生成中，请稍候再切换主题");
+        return;
+      }
       if (el.dataset.topic) state.topicId = el.dataset.topic;
       setModule(el.dataset.go);
     });
@@ -2117,6 +2293,10 @@ function bind() {
   }
   document.querySelectorAll("[data-open-event]").forEach((btn) => {
     btn.addEventListener("click", () => {
+      if (state.sixdimLoading && btn.dataset.openEvent !== state.eventId) {
+        toast("六维分析生成中，请稍候再切换任务");
+        return;
+      }
       state.eventId = btn.dataset.openEvent;
       state.eventMode = "result";
       state.sixdimScope = "event:" + btn.dataset.openEvent;
@@ -2137,10 +2317,7 @@ function bind() {
   if (btnInsightExport) btnInsightExport.onclick = viewReport;
   const btnInsightPlan = $("#btn-insight-plan");
   if (btnInsightPlan) {
-    btnInsightPlan.onclick = () => {
-      setModule("assistant");
-      toast("已跳转智能助手，可继续生成应对方案");
-    };
+    btnInsightPlan.onclick = viewPlan;
   }
   const btnInsightScript = $("#btn-insight-script");
   if (btnInsightScript) btnInsightScript.onclick = () => toast("演示：已按 PRD 模板生成回应话术");

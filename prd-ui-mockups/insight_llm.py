@@ -296,8 +296,10 @@ def _items_to_text(items, limit=80):
     for it in items[:limit]:
         senti = (it.get("sentiment") or {}).get("label", "未标注") if isinstance(it.get("sentiment"), dict) else "未标注"
         t = it.get("publish_time") or ""
+        src = (it.get("source") or "").strip()
+        src_bit = f" [{src}]" if src else ""
         text = ((it.get("title") or "") + " " + (it.get("content") or ""))[:120]
-        lines.append(f"- [{t}] [{senti}] {text}")
+        lines.append(f"- [{t}]{src_bit} [{senti}] {text}")
     return "\n".join(lines)
 
 
@@ -437,6 +439,226 @@ def generate_report(metrics_text: str, items, retries: int = 2):
             continue
         return {"report": content, "review_flag": True, "error": None}
     return {"report": None, "review_flag": True, "error": last_err or "重试后仍失败"}
+
+
+# ============================================================
+# 六、应对方案 / 分型报告（日常 / 格局 / 危机；规则分流 + 人工确认模板后生成）
+# ============================================================
+PLAN_TEMPLATE_IDS = ("daily", "compete", "crisis")
+PLAN_TITLES = {
+    "daily": "日常/定期舆情应对方案",
+    "compete": "市场竞争格局应对方案",
+    "crisis": "突发事件舆情应对方案",
+}
+_NEG_RATIO_CRISIS = 50.0
+_SPIKE_RATIO = 1.8
+_CRISIS_HINTS = ("反转", "投诉", "监管", "召回", "聚集", "游行", "维权", "诉讼", "抵制", "爆炸", "伤亡", "危机")
+_COMPETE_NAME_HINTS = ("生态", "新能源", "终端", "竞品", "格局", "对比", "对标", "市场份额", "苹果", "华为")
+
+_TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+
+PROMPT_PLAN = """你是一位专业的舆情分析师。请基于给定数据，按指定大纲生成一份 Markdown 文档。
+
+【监测主题/事件】：{topic_name}
+【选用模板】：{template_title}（id={template_id}）
+【舆情统计】
+{metrics_text}
+
+【六维研判摘要】
+{sixdim_text}
+
+【建议优先行动】
+{actions_text}
+
+【舆情条目列表】
+{items_text}
+
+请严格按照以下大纲的标题层级输出（不要增删章节，标题文字与大纲保持一致）：
+
+{outline}
+
+{extra_rule}
+
+约束：
+- 只能基于给定统计、六维摘要、优先行动和条目归纳，禁止编造条目中不存在的账号、声明、产品或竞品。
+- 无数据处写「暂无足够数据」，不要用行业常识补全。
+- 三类文档第 1 章均为速览，篇幅不超过全文约 30%；第 2 章起必须是可执行的应对、预案与准则。
+- 日常类：已有独立研判报告，禁止再写声量走势、渠道表现、大事记、热点长文；不要写成战时危机方案。
+- 格局类：以「{topic_name}」为监测对象；竞品名称仅可摘自条目；禁止把 SOV、口碑、营销战役再写成独立大章；无双边数据写「暂无足够数据」，禁止编造对标表。
+- 危机类：禁止再单列传播分析、观点摘录、风险研判大章；第 2–7 章必须是定级、处置清单、分情景预案、沟通准则、监测复盘与人工复核。
+- 优先行动必须对应六维槽点与「建议优先行动」，不要另起一套优先级。
+- 文档末尾附一句：本方案基于网络公开舆情生成，策略建议须人工复核后对外使用。"""
+
+_EXTRA_RULES = {
+    "daily": "这是例行应对方案，不是监测分析报告（分析已由研判报告承担）。第 1 章只写速览，不超过全文约 30%。其余全部写本周必做、分情景处置和准则。不要展开趋势图解读、渠道排行、每日大事记。不要写成危机战时方案。",
+    "compete": "这是竞争应对方案。第 1 章可保留对比结论，但不超过全文约 30%。其余全部写反制清单、分情景预案和沟通准则。不要展开 SOV 长表、功能卖点逐条分析、营销战役复盘。竞品名只能来自条目。",
+    "crisis": "这是应对方案，不是舆情分析报告。第 1 章只写速览，篇幅不超过全文约 30%。其余章节全部写可执行的处置、预案和准则；不要展开声量趋势、渠道分析、网民观点摘录。禁止编造已发布的声明或未出现的责任人姓名，职务用角色（如公关负责人）即可。",
+}
+
+
+def load_plan_outline(template_id: str) -> str:
+    path = os.path.join(_TEMPLATES_DIR, f"{template_id}.md")
+    with open(path, encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def sixdim_brief(sixdim) -> str:
+    if not isinstance(sixdim, dict):
+        return "暂无六维分析"
+    e = sixdim.get("emotion") or {}
+    n = sixdim.get("narrative") or {}
+    s = sixdim.get("spread") or {}
+    b = sixdim.get("behavior") or {}
+    return "\n".join([
+        f"情感：{e.get('sentiment') or '暂无足够数据'}；态度强度：{e.get('attitude_strength') or '暂无足够数据'}；迁移：{e.get('emotion_shift') or '暂无足够数据'}",
+        f"议题框架：{n.get('issue_frame') or '暂无足够数据'}；诉求：{n.get('appeal') or '暂无足够数据'}",
+        f"主阵地：{s.get('platform') or '暂无足够数据'}；是否反转：{s.get('reversal') or '暂无足够数据'}；传播路径：{s.get('path') or '暂无足够数据'}",
+        f"线下行动：{b.get('offline_action') or '暂无足够数据'}；制度化参与：{b.get('institutional') or '暂无足够数据'}",
+    ])
+
+
+def actions_brief(sixdim) -> str:
+    acts = (sixdim or {}).get("actions") if isinstance(sixdim, dict) else None
+    if not acts:
+        return "暂无优先行动"
+    lines = []
+    for a in acts:
+        if not isinstance(a, dict):
+            continue
+        lines.append(f"- [P{a.get('priority', 3)}] {a.get('title') or ''}：{a.get('detail') or ''}")
+    return "\n".join(lines) or "暂无优先行动"
+
+
+def _text_has_crisis_hint(*parts):
+    blob = " ".join(str(p or "") for p in parts)
+    return any(k in blob for k in _CRISIS_HINTS)
+
+
+def _is_volume_spike(trend):
+    if not isinstance(trend, list) or len(trend) < 4:
+        return False
+    counts = []
+    for t in trend:
+        try:
+            counts.append(int((t or {}).get("count") or 0))
+        except (TypeError, ValueError):
+            counts.append(0)
+    early = counts[:-2]
+    late = counts[-2:]
+    early_avg = sum(early) / max(1, len(early))
+    late_avg = sum(late) / max(1, len(late))
+    if early_avg <= 0:
+        return late_avg >= 8
+    return late_avg >= _SPIKE_RATIO * early_avg
+
+
+def _looks_compete(topic_name: str) -> bool:
+    name = topic_name or ""
+    return any(k in name for k in _COMPETE_NAME_HINTS)
+
+
+def route_plan_template(metrics, sixdim, scope="", topic_name=""):
+    """规则推荐模板。永不默认 crisis。返回 {template_id, title, reasons, confidence}。"""
+    reasons = []
+    emo = (metrics or {}).get("emotion") or {}
+    try:
+        neg_ratio = float(emo.get("neg_ratio") or 0)
+    except (TypeError, ValueError):
+        neg_ratio = 0.0
+    trend = (metrics or {}).get("trend") or []
+    spread = (sixdim or {}).get("spread") or {}
+    behavior = (sixdim or {}).get("behavior") or {}
+    narrative = (sixdim or {}).get("narrative") or {}
+
+    is_event = str(scope or "").startswith("event:")
+    spike = _is_volume_spike(trend)
+    crisis_text = _text_has_crisis_hint(
+        spread.get("reversal"), behavior.get("offline_action"), behavior.get("institutional"),
+        spread.get("path"), narrative.get("appeal"),
+    )
+
+    if is_event:
+        reasons.append("当前范围是事件分析任务")
+    if neg_ratio >= _NEG_RATIO_CRISIS:
+        reasons.append(f"负面占比 {neg_ratio:.1f}%（≥{_NEG_RATIO_CRISIS:.0f}%）")
+    if spike:
+        reasons.append("近 7 日声量末段明显高于前期")
+    if crisis_text:
+        reasons.append("六维中出现反转/投诉/监管/召回等危机信号")
+
+    if is_event or neg_ratio >= _NEG_RATIO_CRISIS or spike or crisis_text:
+        tid = "crisis"
+        conf = 0.86 if (is_event or crisis_text) else 0.72
+        return {
+            "template_id": tid,
+            "title": PLAN_TITLES[tid],
+            "reasons": reasons[:3] or ["命中危机分流规则"],
+            "confidence": conf,
+        }
+
+    if _looks_compete(topic_name):
+        return {
+            "template_id": "compete",
+            "title": PLAN_TITLES["compete"],
+            "reasons": [f"主题「{topic_name}」更像竞品/行业对标，而非突发处置"],
+            "confidence": 0.7,
+        }
+
+    return {
+        "template_id": "daily",
+        "title": PLAN_TITLES["daily"],
+        "reasons": ["未命中突发/危机信号，按例行应对方案推荐", "详细数据分析请用「生成研判报告」；若要写战时处置请改选危机模板"],
+        "confidence": 0.65,
+    }
+
+
+def generate_plan(template_id, metrics_text, sixdim, items, topic_name="", retries: int = 2):
+    """按已确认的 template_id 生成分型报告/应对方案（Markdown）。"""
+    if template_id not in PLAN_TEMPLATE_IDS:
+        return {"plan": None, "title": None, "template_id": template_id, "review_flag": True,
+                "error": "未知模板，请选择日常/格局/危机之一"}
+    if not _llm_env()[1]:
+        return {"plan": None, "title": PLAN_TITLES[template_id], "template_id": template_id,
+                "review_flag": True, "error": "未配置 LLM_API_KEY，跳过方案生成"}
+    if not items:
+        return {"plan": None, "title": PLAN_TITLES[template_id], "template_id": template_id,
+                "review_flag": True, "error": "无舆情数据，无法生成方案"}
+    if not sixdim:
+        return {"plan": None, "title": PLAN_TITLES[template_id], "template_id": template_id,
+                "review_flag": True, "error": "请先生成六维分析"}
+
+    try:
+        outline = load_plan_outline(template_id)
+    except OSError:
+        return {"plan": None, "title": PLAN_TITLES[template_id], "template_id": template_id,
+                "review_flag": True, "error": "模板文件缺失"}
+
+    prompt = PROMPT_PLAN.format(
+        topic_name=topic_name or "未命名主题",
+        template_title=PLAN_TITLES[template_id],
+        template_id=template_id,
+        metrics_text=metrics_text or "",
+        sixdim_text=sixdim_brief(sixdim),
+        actions_text=actions_brief(sixdim),
+        items_text=_items_to_text(items),
+        outline=outline,
+        extra_rule=_EXTRA_RULES.get(template_id, ""),
+    )
+    last_err = None
+    for _ in range(max(1, retries)):
+        content = _chat([{"role": "user", "content": prompt}], max_tokens=2800)
+        if not content:
+            last_err = "LLM 返回为空"
+            continue
+        return {
+            "plan": content,
+            "title": PLAN_TITLES[template_id],
+            "template_id": template_id,
+            "review_flag": True,
+            "error": None,
+        }
+    return {"plan": None, "title": PLAN_TITLES[template_id], "template_id": template_id,
+            "review_flag": True, "error": last_err or "重试后仍失败"}
 
 
 if __name__ == "__main__":
