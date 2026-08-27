@@ -19,6 +19,10 @@ __pycache__/
 *.zip
 package.bat
 
+# ===== 下载解压的副本（不入库）=====
+yuqing-agent-main*/
+yuqing-agent-main (1)/
+
 # ===== 系统文件 =====
 .DS_Store
 Thumbs.db
