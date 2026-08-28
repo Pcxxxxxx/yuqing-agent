@@ -11,12 +11,15 @@ API:
   /api/articles?topic&media&sentiment&q&limit   文章列表
   /api/hot                   热词榜
   /api/assistant?q           智能助手（规则分析数据）
-  /api/themes POST           保存新建监测主题
+  /api/themes POST           保存或更新监测主题
+  /api/plan-route POST       应对方案模板规则推荐（需六维）
+  /api/plan POST             按已确认模板生成应对方案/分型报告
 """
 import os
 import sys
 import json
 import re
+import copy
 import datetime as dt
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -126,6 +129,7 @@ THEMES = [
     {"id": "t_hot", "name": "全网热搜", "keywords": [], "source_only": "baidu_hot",
      "meta": "百度热搜 · 运行中", "status": "运行中"},
 ]
+THEMES_BUILTIN = copy.deepcopy(THEMES)
 
 SRC_NAME = {"it_home": "IT之家", "sspai": "少数派", "baidu_hot": "百度热搜",
              "ifanr": "爱范儿", "geekpark": "极客公园", "leiphone": "雷锋网",
@@ -194,41 +198,153 @@ def _recompute():
     return _sentiment_snapshot()
 
 
-def _load_custom_themes():
-    """加载 themes.json 的自定义主题，合并到 THEMES（运行时参与匹配）。"""
-    global THEMES
-    if not os.path.exists(THEMES_FILE):
-        return
-    try:
-        with open(THEMES_FILE, encoding="utf-8-sig") as f:
-            customs = json.load(f)
-    except Exception:
-        return
-    base = [t for t in THEMES if str(t["id"]).startswith("t_")]
-    idx = 1
-    for c in customs:
-        name = (c.get("name") or "").strip()
-        keywords = (c.get("keywords") or "").strip()
-        if not name:
-            continue
-        if any(t["name"] == name for t in base):
-            continue
-        theme = {"id": f"c_{idx}", "name": name, "keywords": [],
-                 "meta": f"{c.get('group') or '自定义'} · 运行中", "status": "运行中"}
-        # 识别数据源别名（如"微博热搜"→按 weibo_hot 数据源监测）
+def _split_kws(val):
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    s = (val or "").strip()
+    if not s:
+        return []
+    return [x for x in re.split(r"[\s+|/]+", s) if x]
+
+
+def _apply_theme_record(theme, rec):
+    """用 themes.json 一条记录覆盖主题字段。"""
+    if rec.get("name"):
+        theme["name"] = rec["name"].strip()
+    if "keywords" in rec:
+        theme["keywords"] = _split_kws(rec.get("keywords"))
+        blob = (theme.get("name") or "") + " " + " ".join(theme["keywords"])
         matched_src = None
         for alias, src in SRC_ALIAS.items():
-            if alias.lower() in name.lower() or alias.lower() in keywords.lower():
+            if alias.lower() in blob.lower():
                 matched_src = src
                 break
         if matched_src:
             theme["source_only"] = matched_src
             theme["meta"] = f"{SRC_NAME.get(matched_src, matched_src)} · 运行中"
         else:
-            theme["keywords"] = re.split(r"[\s+|/]+", keywords)
-        base.append(theme)
-        idx += 1
-    THEMES = base
+            builtin = next((t for t in THEMES_BUILTIN if t["id"] == theme.get("id")), None)
+            if builtin and builtin.get("source_only"):
+                theme["source_only"] = builtin["source_only"]
+            else:
+                theme.pop("source_only", None)
+    if "exclude" in rec:
+        theme["exclude"] = _split_kws(rec.get("exclude"))
+    group = (rec.get("group") or "").strip()
+    if group:
+        theme["group"] = group
+        theme["meta"] = f"{group} · {theme.get('status') or '运行中'}"
+    if "alert" in rec:
+        theme["alert"] = bool(rec.get("alert"))
+    return theme
+
+
+def _new_theme_from_record(rec, tid):
+    theme = {
+        "id": tid,
+        "name": (rec.get("name") or "").strip() or "未命名",
+        "keywords": [],
+        "exclude": [],
+        "meta": f"{rec.get('group') or '自定义'} · 运行中",
+        "status": "运行中",
+        "group": rec.get("group") or "自定义",
+    }
+    return _apply_theme_record(theme, rec)
+
+
+def _load_custom_themes():
+    """从 themes.json 覆盖内置主题、合并自定义主题。"""
+    global THEMES
+    base = copy.deepcopy(THEMES_BUILTIN)
+    by_id = {t["id"]: t for t in base}
+    if not os.path.exists(THEMES_FILE):
+        THEMES = base
+        return
+    try:
+        with open(THEMES_FILE, encoding="utf-8-sig") as f:
+            customs = json.load(f)
+    except Exception:
+        THEMES = base
+        return
+    if not isinstance(customs, list):
+        THEMES = base
+        return
+    extra = []
+    for c in customs:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("id") or "").strip()
+        name = (c.get("name") or "").strip()
+        if cid and cid in by_id:
+            _apply_theme_record(by_id[cid], c)
+            continue
+        if not name:
+            continue
+        if any(t["name"] == name for t in base) and not cid:
+            continue
+        tid = cid if cid.startswith("c_") else f"c_{len(extra) + 1}"
+        extra.append(_new_theme_from_record(c, tid))
+    THEMES = list(by_id.values()) + extra
+
+
+def _read_themes_file():
+    if not os.path.exists(THEMES_FILE):
+        return []
+    try:
+        with open(THEMES_FILE, encoding="utf-8-sig") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _write_themes_file(rows):
+    folder = os.path.dirname(THEMES_FILE)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(THEMES_FILE, "w", encoding="utf-8-sig") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
+
+def _save_theme(body):
+    """新建或更新监测主题，写入 themes.json 后重新装载。"""
+    name = (body.get("name") or "").strip()
+    keywords = body.get("keywords") if body.get("keywords") is not None else ""
+    if isinstance(keywords, list):
+        keywords = "|".join(str(x) for x in keywords if str(x).strip())
+    keywords = str(keywords).strip()
+    if not name:
+        return {"ok": False, "error": "请填写方案名称"}
+    tid = str(body.get("id") or "").strip()
+    rec = {
+        "name": name,
+        "group": (body.get("group") or "").strip() or "自定义",
+        "keywords": keywords,
+        "exclude": (body.get("exclude") or "").strip(),
+        "alert": bool(body.get("alert")),
+        "update_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    rows = _read_themes_file()
+    if tid:
+        rec["id"] = tid
+        found = False
+        for i, r in enumerate(rows):
+            if str(r.get("id") or "") == tid:
+                rec["create_time"] = r.get("create_time") or rec["update_time"]
+                rows[i] = rec
+                found = True
+                break
+        if not found:
+            rec["create_time"] = rec["update_time"]
+            rows.append(rec)
+    else:
+        rec["id"] = "c_" + dt.datetime.now().strftime("%Y%m%d%H%M%S")
+        rec["create_time"] = rec["update_time"]
+        rows.append(rec)
+        tid = rec["id"]
+    _write_themes_file(rows)
+    _load_custom_themes()
+    return {"ok": True, "id": tid}
 
 
 def _load():
@@ -283,6 +399,9 @@ def _rel_time(t):
 
 def _match_theme(theme, row):
     text = (row.get("title") or "") + " " + (row.get("content") or "")[:200]
+    for ex in theme.get("exclude") or []:
+        if ex and ex.lower() in text.lower():
+            return False
     if theme.get("source_only"):
         return row["source"] == theme["source_only"]
     return any(kw.lower() in text.lower() for kw in theme["keywords"])
@@ -533,6 +652,35 @@ def _insight_emotion():
     return res
 
 
+def _sample_feed_from_rows(rows):
+    """分层采样：负面/正面/中性各取若干，带上来源供模型引用。"""
+    ordered = sorted(rows, key=lambda r: r.get("publish_time") or dt.datetime.min)
+    neg = [r for r in ordered if r.get("sentiment_label") == "负面"]
+    pos = [r for r in ordered if r.get("sentiment_label") == "正面"]
+    neu = [r for r in ordered if r.get("sentiment_label") == "中性"]
+    sample = (neg[-12:] + pos[-8:] + neu[-12:])
+    sample.sort(key=lambda r: r.get("publish_time") or dt.datetime.min)
+    return [{
+        "title": r.get("title"),
+        "content": r.get("content"),
+        "publish_time": str(r.get("publish_time") or ""),
+        "source": SRC_NAME.get(r.get("source"), r.get("source") or ""),
+        "sentiment": {"label": r.get("sentiment_label", "中性")},
+    } for r in sample]
+
+
+def _metrics_text(scope=None):
+    m = _metrics(scope)
+    emo = m["emotion"]
+    return (
+        f"舆情总量 {m['total']} 条；"
+        f"情感分布：正面 {emo['pos']} 条（{emo['pos_ratio']}%）、中性 {emo['neu']} 条（{emo['neu_ratio']}%）、"
+        f"负面 {emo['neg']} 条（{emo['neg_ratio']}%）；"
+        f"来源构成：" + "、".join(f"{s['source']} {s['count']} 条" for s in m["source"]) + "；"
+        f"近7天声量：" + "、".join(f"{t['date']} {t['count']} 条" for t in m["trend"]) + "。"
+    )
+
+
 def _insight_sixdim(scope=None):
     """调用 LLM 对当前范围（主题/事件）文章做「六维舆情分析」。"""
     if not _insight:
@@ -542,19 +690,7 @@ def _insight_sixdim(scope=None):
     scoped = _scope_rows(scope)
     if not scoped:
         return {"available": False, "error": "当前主题/事件下暂无舆情数据，无法生成六维分析"}
-    rows = sorted(scoped, key=lambda r: r.get("publish_time") or dt.datetime.min)
-    # 分层采样：负面/正面/中性各取若干，保证归纳覆盖不同情感
-    neg = [r for r in rows if r.get("sentiment_label") == "负面"]
-    pos = [r for r in rows if r.get("sentiment_label") == "正面"]
-    neu = [r for r in rows if r.get("sentiment_label") == "中性"]
-    sample = (neg[-12:] + pos[-8:] + neu[-12:])
-    sample.sort(key=lambda r: r.get("publish_time") or dt.datetime.min)
-    feed = [{
-        "title": r.get("title"),
-        "content": r.get("content"),
-        "publish_time": str(r.get("publish_time") or ""),
-        "sentiment": {"label": r.get("sentiment_label", "中性")},
-    } for r in sample]
+    feed = _sample_feed_from_rows(scoped)
     res = _insight.summarize_sixdimensions(feed, retries=2)
     if res.get("six_dimensions"):
         print("[insight-sixdim] 六维分析成功")
@@ -572,33 +708,53 @@ def _gen_report(scope=None):
     scoped = _scope_rows(scope)
     if not scoped:
         return {"available": False, "error": "当前主题/事件下暂无舆情数据，无法生成报告"}
-    m = _metrics(scope)
-    emo = m["emotion"]
-    metrics_text = (
-        f"舆情总量 {m['total']} 条；"
-        f"情感分布：正面 {emo['pos']} 条（{emo['pos_ratio']}%）、中性 {emo['neu']} 条（{emo['neu_ratio']}%）、"
-        f"负面 {emo['neg']} 条（{emo['neg_ratio']}%）；"
-        f"来源构成：" + "、".join(f"{s['source']} {s['count']} 条" for s in m["source"]) + "；"
-        f"近7天声量：" + "、".join(f"{t['date']} {t['count']} 条" for t in m["trend"]) + "。"
-    )
-    # 分层采样条目（负面/正面/中性）
-    rows = sorted(scoped, key=lambda r: r.get("publish_time") or dt.datetime.min)
-    neg = [r for r in rows if r.get("sentiment_label") == "负面"]
-    pos = [r for r in rows if r.get("sentiment_label") == "正面"]
-    neu = [r for r in rows if r.get("sentiment_label") == "中性"]
-    sample = (neg[-12:] + pos[-8:] + neu[-12:])
-    sample.sort(key=lambda r: r.get("publish_time") or dt.datetime.min)
-    feed = [{
-        "title": r.get("title"),
-        "content": r.get("content"),
-        "publish_time": str(r.get("publish_time") or ""),
-        "sentiment": {"label": r.get("sentiment_label", "中性")},
-    } for r in sample]
+    metrics_text = _metrics_text(scope)
+    feed = _sample_feed_from_rows(scoped)
     res = _insight.generate_report(metrics_text, feed, retries=1)
     if res.get("report"):
         print("[report] 报告生成成功")
     else:
         print(f"[report] 报告生成失败：{res.get('error')}")
+    return res
+
+
+def _plan_route(scope=None, sixdim=None, topic_name=""):
+    """规则推荐应对方案模板（不调用大模型）。"""
+    if not _insight:
+        return {"available": False, "error": "insight_llm 模块未加载"}
+    if not sixdim:
+        return {"available": False, "error": "请先生成六维分析"}
+    metrics = _metrics(scope)
+    route = _insight.route_plan_template(metrics, sixdim, scope=scope or "", topic_name=topic_name or "")
+    route["available"] = True
+    route["hint"] = (
+        "三种模板都是应对方案（分析约三成）。当前不像突发；要写战时处置请改选危机模板。详细数据请用研判报告。"
+        if route.get("template_id") != "crisis"
+        else "危机应对方案须确认后才生成，结果须人工复核后对外使用"
+    )
+    return route
+
+
+def _gen_plan(scope=None, template_id="", sixdim=None, topic_name=""):
+    """按用户确认的模板生成应对方案/分型报告。"""
+    if not _insight:
+        return {"available": False, "error": "insight_llm 模块未加载"}
+    if not os.environ.get("LLM_API_KEY"):
+        return {"available": False, "error": "未配置大模型，请在设置页填写 LLM 的 API Key"}
+    if not sixdim:
+        return {"available": False, "error": "请先生成六维分析"}
+    scoped = _scope_rows(scope)
+    if not scoped:
+        return {"available": False, "error": "当前主题/事件下暂无舆情数据，无法生成方案"}
+    feed = _sample_feed_from_rows(scoped)
+    res = _insight.generate_plan(
+        template_id, _metrics_text(scope), sixdim, feed,
+        topic_name=topic_name or "", retries=1,
+    )
+    if res.get("plan"):
+        print(f"[plan] 方案生成成功 template={template_id}")
+    else:
+        print(f"[plan] 方案生成失败：{res.get('error')}")
     return res
 
 
@@ -653,6 +809,12 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=_HERE, **kw)
 
+    def end_headers(self):
+        # 原型开发：禁止浏览器缓存 JS/CSS/HTML，避免改完前端不生效
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        super().end_headers()
+
     def _json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -702,6 +864,17 @@ class Handler(SimpleHTTPRequestHandler):
             if urlparse(self.path).path == "/api/report":
                 qs = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
                 return self._json({"code": 0, "data": _gen_report(qs.get("scope"))})
+            if urlparse(self.path).path == "/api/plan-route":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or "{}")
+                return self._json({"code": 0, "data": _plan_route(
+                    body.get("scope"), body.get("six_dimensions"), body.get("topic_name") or "")})
+            if urlparse(self.path).path == "/api/plan":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or "{}")
+                return self._json({"code": 0, "data": _gen_plan(
+                    body.get("scope"), body.get("template_id") or "",
+                    body.get("six_dimensions"), body.get("topic_name") or "")})
             if urlparse(self.path).path == "/api/config":
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or "{}")
@@ -710,15 +883,10 @@ class Handler(SimpleHTTPRequestHandler):
             if urlparse(self.path).path == "/api/themes":
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or "{}")
-                themes = []
-                if os.path.exists(THEMES_FILE):
-                    with open(THEMES_FILE, encoding="utf-8-sig") as f:
-                        themes = json.load(f)
-                themes.append({**body, "create_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-                with open(THEMES_FILE, "w", encoding="utf-8-sig") as f:
-                    json.dump(themes, f, ensure_ascii=False)
-                _load_custom_themes()  # 保存后立即生效
-                return self._json({"code": 0, "data": {"ok": True}})
+                saved = _save_theme(body)
+                if not saved.get("ok"):
+                    return self._json({"code": 1, "data": saved, "msg": saved.get("error") or "保存失败"})
+                return self._json({"code": 0, "data": saved})
             return self._json({"code": 404, "msg": "not found"}, 404)
         except Exception as e:
             print(f"[server] POST 处理异常：{e}")

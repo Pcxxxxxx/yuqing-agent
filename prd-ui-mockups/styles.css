@@ -162,6 +162,12 @@ body {
   background: rgba(31, 107, 92, 0.35);
   color: #fff;
 }
+.sider-item.is-disabled,
+.sider-item.is-disabled:hover {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: transparent;
+}
 .sider-item__name { font-size: 14px; font-weight: 600; }
 .sider-item__meta { margin-top: 3px; font-size: 12px; opacity: 0.7; }
 
@@ -1205,6 +1211,12 @@ body {
 }
 .insight-cockpit .btn--primary { background: #059669; color: #fff; border: 0; }
 .insight-cockpit .btn--primary:hover { background: #047857; }
+.insight-cockpit .btn--primary:disabled,
+.insight-cockpit .btn--primary:disabled:hover {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: #059669;
+}
 .insight-cockpit .btn--secondary { background: #fff; color: #374151; border-color: #d1d5db; }
 .insight-cockpit .btn--sm { padding: 5px 12px; font-size: 12px; border-radius: 6px; }
 
@@ -1393,6 +1405,42 @@ body {
 }
 .report-loading p { margin: 0; font-size: 14px; color: var(--ink); }
 .report-loading .muted { font-size: 12px; }
+
+.modal--plan-confirm { width: min(560px, 100%); }
+.plan-reasons {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  font-size: 13px;
+  color: #374151;
+  line-height: 1.55;
+}
+.plan-confirm-hint {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #92400e;
+  background: #fef3c7;
+  padding: 8px 10px;
+  border-radius: 8px;
+  line-height: 1.5;
+}
+.plan-template-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0 16px; }
+.plan-template-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.plan-template-item:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.plan-template-item strong { display: block; font-size: 14px; color: var(--ink); }
+.plan-template-item span { display: block; margin-top: 2px; font-size: 12px; color: var(--muted); }
+.plan-template-item input { margin-top: 3px; }
+
 .spinner {
   width: 36px;
   height: 36px;
