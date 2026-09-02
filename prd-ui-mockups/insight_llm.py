@@ -69,7 +69,10 @@ PROMPT_SUMMARIZE = """你是一位专业的舆情情感分析师。以下是某�
 {{"attitude_strength":{{"激烈":0,"中等":0,"温和":0}},"stance_split":{{"支持":0,"反对":0,"中立":0,"理中客":0}},"emotion_shift":"","dominant_emotion":"无","reasons":[],"confidence":0.0}}"""
 
 # 六维舆情分析 Prompt（对齐 PRD(4) 六维：基础/情感/叙事/传播/行为/深层）
-PROMPT_SIXDIM = """你是一位专业的舆情分析师。以下是某主题/事件下的一批舆情条目（含标题、摘要、来源、时间、情感标签）。
+PROMPT_SIXDIM = """你是一位专业的舆情分析师。以下是某主题/事件下的一批舆情条目（含 id、标题、摘要、来源、时间、情感标签）。
+
+【舆情统计】（真实统计。声量、情感占比、来源构成必须以这里为准，禁止另写一套数字）
+{metrics_text}
 
 【条目列表】：
 {items_text}
@@ -77,17 +80,25 @@ PROMPT_SIXDIM = """你是一位专业的舆情分析师。以下是某主题/事
 请基于这些真实条目，输出该主题/事件的「六维舆情分析」，仅输出一个 JSON 对象，不要输出任何解释、不要用 Markdown 代码块包裹：
 
 1. basic 基础信息：volume（声量概述）、voice_profile（发声画像）、expression（表达方式），各一句话
-2. emotion 情感与态度：sentiment（情感性质概述）、attitude_strength（态度强度）、emotion_shift（情感迁移），各一句话；stance_split（立场分化，百分比对象，和为100）
+2. emotion 情感与态度：sentiment（情感性质概述）、attitude_strength（态度强度）、emotion_shift（情感迁移），各一句话；stance_split（立场分化，百分比对象，和为100；此为估计，须与统计情感分布区分）
 3. narrative 叙事与框架：issue_frame（议题框架）、symbol_metaphor（符号隐喻）、attribution（归因）、appeal（诉求），各一句话
-4. spread 传播结构：path（传播路径）、kols（意见领袖）、platform（平台情况）、reversal（是否反转），各一句话
+4. spread 传播结构：path（传播路径）、kols（意见领袖）、platform（平台情况）、reversal（是否反转），各一句话。无转发链数据时写「暂无足够数据」或仅概括来源构成
 5. behavior 行为倾向：offline_action（线下行动）、consumption（消费影响）、institutional（制度化参与）、info_seeking（信息搜寻），各一句话
 6. deep_impact 深层影响：social_emotion（社会情绪）、group_diff（群体差异）、value_conflict（价值观冲突）、historical_analogy（历史类比），各一句话
 7. actions 建议优先行动：3~4 条，每条 {{priority: 1-3 的整数（1 为最高优先级）, title: 行动标题（12字内）, detail: 行动说明（30字内）}}
+8. evidence 原文依据：为每个不是「暂无足够数据」的结论字段列 2～4 条。每条 {{field: 字段路径, id: 条目id整数, quote: 从该条目原文逐字摘录20～60字}}。field 必须是下列之一：
+   basic.volume, basic.voice_profile, basic.expression,
+   emotion.sentiment, emotion.attitude_strength, emotion.emotion_shift,
+   narrative.issue_frame, narrative.symbol_metaphor, narrative.attribution, narrative.appeal,
+   spread.path, spread.kols, spread.platform, spread.reversal,
+   behavior.offline_action, behavior.consumption, behavior.institutional, behavior.info_seeking,
+   deep_impact.social_emotion, deep_impact.group_diff, deep_impact.value_conflict, deep_impact.historical_analogy,
+   actions
 
-约束：只能基于给定条目归纳，禁止编造条目中不存在的信息；证据不足时该字段写「暂无足够数据」。
+约束：只能基于给定条目归纳，禁止编造；quote 必须是对应 id 条目标题或正文的连续原文，禁止改写；证据不足时该字段写「暂无足够数据」且不要硬凑 evidence。
 
 输出格式（严格按此结构）：
-{{"basic":{{"volume":"","voice_profile":"","expression":""}},"emotion":{{"sentiment":"","attitude_strength":"","stance_split":{{"支持":0,"反对":0,"中立":0,"理中客":0}},"emotion_shift":""}},"narrative":{{"issue_frame":"","symbol_metaphor":"","attribution":"","appeal":""}},"spread":{{"path":"","kols":"","platform":"","reversal":""}},"behavior":{{"offline_action":"","consumption":"","institutional":"","info_seeking":""}},"deep_impact":{{"social_emotion":"","group_diff":"","value_conflict":"","historical_analogy":""}},"actions":[{{"priority":1,"title":"","detail":""}}]}}"""
+{{"basic":{{"volume":"","voice_profile":"","expression":""}},"emotion":{{"sentiment":"","attitude_strength":"","stance_split":{{"支持":0,"反对":0,"中立":0,"理中客":0}},"emotion_shift":""}},"narrative":{{"issue_frame":"","symbol_metaphor":"","attribution":"","appeal":""}},"spread":{{"path":"","kols":"","platform":"","reversal":""}},"behavior":{{"offline_action":"","consumption":"","institutional":"","info_seeking":""}},"deep_impact":{{"social_emotion":"","group_diff":"","value_conflict":"","historical_analogy":""}},"actions":[{{"priority":1,"title":"","detail":""}}],"evidence":[{{"field":"emotion.emotion_shift","id":0,"quote":""}}]}}"""
 
 # 舆情研判分析报告 Prompt（对齐 PRD(4)《舆情研判分析报告模板》8 段式，输出 Markdown）
 PROMPT_REPORT = """你是一位专业的舆情分析师。请基于以下舆情数据，生成一份《舆情研判分析报告》。
@@ -298,8 +309,10 @@ def _items_to_text(items, limit=80):
         t = it.get("publish_time") or ""
         src = (it.get("source") or "").strip()
         src_bit = f" [{src}]" if src else ""
-        text = ((it.get("title") or "") + " " + (it.get("content") or ""))[:120]
-        lines.append(f"- [{t}]{src_bit} [{senti}] {text}")
+        aid = it.get("id")
+        id_bit = f"[id={aid}] " if aid is not None and aid != "" else ""
+        text = ((it.get("title") or "") + " " + (it.get("content") or ""))[:160]
+        lines.append(f"- {id_bit}[{t}]{src_bit} [{senti}] {text}")
     return "\n".join(lines)
 
 
@@ -391,17 +404,21 @@ def _fill_defaults(obj):
     return out
 
 
-def summarize_sixdimensions(items, retries: int = 2):
-    """六维舆情分析（LLM 归纳）。返回 {six_dimensions, review_flag, error}。"""
+def summarize_sixdimensions(items, retries: int = 2, metrics_text: str = ""):
+    """六维舆情分析（LLM 归纳）。返回 {six_dimensions, evidence, review_flag, error}。"""
     if not _llm_env()[1] or not items:
-        return {"six_dimensions": None, "review_flag": True,
+        return {"six_dimensions": None, "evidence": [], "review_flag": True,
                 "error": "未配置 LLM_API_KEY 或无条目，跳过六维归纳"}
 
     last_err = None
+    def _brace_escape(s):
+        return (s or "").replace("{", "{{").replace("}", "}}")
+    prompt = PROMPT_SIXDIM.format(
+        items_text=_brace_escape(_items_to_text(items)),
+        metrics_text=_brace_escape(metrics_text or "暂无统计"),
+    )
     for _ in range(max(1, retries)):
-        content = _chat([{"role": "user",
-                          "content": PROMPT_SIXDIM.format(items_text=_items_to_text(items))}],
-                        max_tokens=2500)
+        content = _chat([{"role": "user", "content": prompt}], max_tokens=4000)
         obj = _parse_json(content)
         if obj is None:
             last_err = "LLM 返回无法解析为 JSON"
@@ -410,12 +427,15 @@ def summarize_sixdimensions(items, retries: int = 2):
         if err:
             last_err = err
             continue
+        evidence = obj.get("evidence") if isinstance(obj.get("evidence"), list) else []
         return {
             "six_dimensions": _fill_defaults(obj),
+            "evidence": evidence,
             "review_flag": True,
             "error": None,
         }
-    return {"six_dimensions": None, "review_flag": True, "error": last_err or "重试后仍失败"}
+    return {"six_dimensions": None, "evidence": [], "review_flag": True,
+            "error": last_err or "重试后仍失败"}
 
 
 # ============================================================
@@ -659,6 +679,216 @@ def generate_plan(template_id, metrics_text, sixdim, items, topic_name="", retri
         }
     return {"plan": None, "title": PLAN_TITLES[template_id], "template_id": template_id,
             "review_flag": True, "error": last_err or "重试后仍失败"}
+
+
+# ============================================================
+# 七、推理依据：核验摘录、对齐统计、组装前端抽屉数据
+# ============================================================
+_BASIS_FIELDS = [
+    ("basic.volume", "1. 基础信息", "声量"),
+    ("basic.voice_profile", "1. 基础信息", "发声画像"),
+    ("basic.expression", "1. 基础信息", "表达方式"),
+    ("emotion.sentiment", "2. 情感与态度", "情感性质"),
+    ("emotion.attitude_strength", "2. 情感与态度", "态度强度"),
+    ("emotion.stance_split", "2. 情感与态度", "立场分化"),
+    ("emotion.emotion_shift", "2. 情感与态度", "情感迁移"),
+    ("narrative.issue_frame", "3. 叙事与框架", "议题框架"),
+    ("narrative.symbol_metaphor", "3. 叙事与框架", "符号隐喻"),
+    ("narrative.attribution", "3. 叙事与框架", "归因"),
+    ("narrative.appeal", "3. 叙事与框架", "诉求"),
+    ("spread.path", "4. 传播结构", "传播路径"),
+    ("spread.kols", "4. 传播结构", "意见领袖"),
+    ("spread.platform", "4. 传播结构", "平台情况"),
+    ("spread.reversal", "4. 传播结构", "是否反转"),
+    ("behavior.offline_action", "5. 行为倾向", "线下行动"),
+    ("behavior.consumption", "5. 行为倾向", "消费影响"),
+    ("behavior.institutional", "5. 行为倾向", "制度化参与"),
+    ("behavior.info_seeking", "5. 行为倾向", "信息搜寻"),
+    ("deep_impact.social_emotion", "6. 深层影响", "社会情绪"),
+    ("deep_impact.group_diff", "6. 深层影响", "群体差异"),
+    ("deep_impact.value_conflict", "6. 深层影响", "价值观冲突"),
+    ("deep_impact.historical_analogy", "6. 深层影响", "历史类比"),
+]
+_STATS_REF = {
+    "basic.volume": ["total", "trend"],
+    "basic.voice_profile": ["source"],
+    "emotion.sentiment": ["emotion"],
+    "spread.platform": ["source"],
+}
+_DEFAULT_EXPAND = {
+    "emotion.emotion_shift",
+    "narrative.issue_frame", "narrative.symbol_metaphor", "narrative.attribution", "narrative.appeal",
+    "deep_impact.social_emotion", "deep_impact.group_diff",
+    "deep_impact.value_conflict", "deep_impact.historical_analogy",
+}
+_EMPTY_CLAIMS = {"", "暂无足够数据", "None", "null"}
+_PUNCT_RE = re.compile(r"[\s\u3000，。！？、；：\"'“”‘’《》【】（）()\[\].,!?;:]+")
+
+
+def _strip_punct(s):
+    return _PUNCT_RE.sub("", s or "")
+
+
+def _verify_quote(quote, item):
+    """摘录是否出现在条目标题或正文中（去空白后精确匹配，再尝试去标点）。"""
+    q = (quote or "").strip()
+    if len(q) < 8:
+        return False
+    blob = (item.get("title") or "") + (item.get("content") or "")
+    compact_q = re.sub(r"\s+", "", q)
+    compact_blob = re.sub(r"\s+", "", blob)
+    if compact_q and compact_q in compact_blob:
+        return True
+    q2, b2 = _strip_punct(q), _strip_punct(blob)
+    return bool(q2) and len(q2) >= 8 and q2 in b2
+
+
+def _claim_of(sixdim, field_key):
+    dim, name = field_key.split(".", 1)
+    val = (sixdim.get(dim) or {}).get(name)
+    if isinstance(val, dict):
+        return "、".join(f"{k}{v}%" for k, v in val.items())
+    return str(val or "")
+
+
+def _feed_index(feed):
+    idx = {}
+    for it in feed or []:
+        try:
+            idx[int(it.get("id"))] = it
+        except (TypeError, ValueError):
+            continue
+    return idx
+
+
+def _first_count(text):
+    m = re.search(r"(\d{1,5})\s*条", text or "")
+    return int(m.group(1)) if m else None
+
+
+def _stats_conflict(field_key, claim, metrics):
+    """结论里的数字/表述是否与真实统计明显不一致。"""
+    if not metrics or not claim or claim in _EMPTY_CLAIMS:
+        return False
+    emo = metrics.get("emotion") or {}
+    try:
+        neg = float(emo.get("neg_ratio") or 0)
+        pos = float(emo.get("pos_ratio") or 0)
+    except (TypeError, ValueError):
+        neg, pos = 0.0, 0.0
+    if field_key == "basic.volume":
+        n = _first_count(claim)
+        total = metrics.get("total")
+        if n is not None and total is not None and abs(n - int(total)) > max(3, int(int(total) * 0.15)):
+            return True
+    if field_key == "emotion.sentiment":
+        if re.search(r"负面.{0,8}(过半|为主|占优)", claim) or re.search(r"(过半|为主).{0,8}负面", claim):
+            if neg < 50:
+                return True
+        if re.search(r"正面.{0,8}(过半|为主|占优)", claim) or re.search(r"(过半|为主).{0,8}正面", claim):
+            if pos < 50:
+                return True
+        m = re.search(r"负面\s*(\d{1,3}(?:\.\d+)?)\s*%", claim)
+        if m and abs(float(m.group(1)) - neg) > 8:
+            return True
+        m = re.search(r"正面\s*(\d{1,3}(?:\.\d+)?)\s*%", claim)
+        if m and abs(float(m.group(1)) - pos) > 8:
+            return True
+    return False
+
+
+def _shape_evidence_item(aid, quote, item, verified, missing=False):
+    senti = ""
+    if item:
+        raw = item.get("sentiment")
+        senti = raw.get("label") if isinstance(raw, dict) else (raw or "")
+    return {
+        "id": aid,
+        "title": (item or {}).get("title") or "",
+        "source": (item or {}).get("source") or "",
+        "time": str((item or {}).get("publish_time") or "")[:16],
+        "sentiment": senti,
+        "url": (item or {}).get("url") or "",
+        "quote": (quote or "").strip()[:80],
+        "verified": bool(verified),
+        "missing": bool(missing),
+    }
+
+
+def build_basis(sixdim, evidence_raw, feed, metrics, meta):
+    """把模型引用的 evidence 核验后，组装成前端「推理依据」抽屉数据。"""
+    idx = _feed_index(feed)
+    buckets = {k: [] for k, _, _ in _BASIS_FIELDS}
+    buckets["actions"] = []
+    known = set(buckets)
+
+    for ev in evidence_raw or []:
+        if not isinstance(ev, dict):
+            continue
+        field = str(ev.get("field") or "").strip()
+        if field.startswith("actions"):
+            field = "actions"
+        if field not in known:
+            continue
+        try:
+            aid = int(ev.get("id"))
+        except (TypeError, ValueError):
+            continue
+        quote = str(ev.get("quote") or "").strip()
+        item = idx.get(aid)
+        if not item:
+            buckets[field].append(_shape_evidence_item(aid, quote, None, False, missing=True))
+            continue
+        buckets[field].append(_shape_evidence_item(aid, quote, item, _verify_quote(quote, item)))
+
+    fields = {}
+    no_evidence, unverified, stats_conflict = [], [], []
+    for key, dim_title, label in _BASIS_FIELDS:
+        claim = _claim_of(sixdim or {}, key)
+        empty = claim in _EMPTY_CLAIMS
+        evs = (buckets.get(key) or [])[:4]
+        conflict = _stats_conflict(key, claim, metrics)
+        stats_ref = _STATS_REF.get(key, [])
+        stats_match = None
+        if stats_ref and not empty:
+            stats_match = not conflict
+        if empty:
+            status = "insufficient"
+        elif conflict:
+            status = "stats_conflict"
+            stats_conflict.append(key)
+        elif not evs:
+            status = "no_evidence"
+            no_evidence.append(key)
+        elif any(not e.get("verified") for e in evs):
+            status = "unverified"
+            unverified.append(key)
+        else:
+            status = "ok"
+        fields[key] = {
+            "dim": dim_title,
+            "label": label,
+            "claim": claim,
+            "stats_ref": stats_ref,
+            "stats_match": stats_match,
+            "expand": key in _DEFAULT_EXPAND or status in ("stats_conflict", "unverified"),
+            "status": status,
+            "evidence": evs,
+        }
+
+    return {
+        "meta": {**(meta or {}), "stats": metrics or {}},
+        "fields": fields,
+        "actions": {
+            "items": (sixdim or {}).get("actions") or [],
+            "evidence": (buckets.get("actions") or [])[:6],
+        },
+        "review": {
+            "no_evidence": no_evidence,
+            "unverified": unverified,
+            "stats_conflict": stats_conflict,
+        },
+    }
 
 
 if __name__ == "__main__":

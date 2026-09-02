@@ -6,7 +6,7 @@ PRD 可交互原型 · 数据服务（自包含版）
 启动: py server.py [端口]   （默认 8091）
 访问: http://127.0.0.1:8091/
 API:
-  /api/overview              工作台 KPI
+  /api/overview              工作台 KPI（含规则苗头预警 attention）
   /api/topics                监测主题列表
   /api/articles?topic&media&sentiment&q&limit   文章列表
   /api/hot                   热词榜
@@ -131,6 +131,17 @@ THEMES = [
 ]
 THEMES_BUILTIN = copy.deepcopy(THEMES)
 
+# 主题预警配置（表单字段原样落盘；本档只把 alert/alertWords/alertContent/alertMatch 用于扫描）
+_ALERT_KEYS = (
+    "alertName", "alertWords", "alertContent", "alertMatch",
+    "alertSources", "alertChannel", "alertWeekend", "alertMerge",
+    "alertDedup", "alertTime", "alertInterval", "alertIntervalHours",
+)
+_NEG_RATIO_CRISIS = 50.0
+_SPIKE_RATIO = 1.8
+_CRISIS_HINTS = ("反转", "投诉", "监管", "召回", "聚集", "游行", "维权", "诉讼", "抵制", "爆炸", "伤亡", "危机")
+_ATTN_LIMIT = 8
+
 SRC_NAME = {"it_home": "IT之家", "sspai": "少数派", "baidu_hot": "百度热搜",
              "ifanr": "爱范儿", "geekpark": "极客公园", "leiphone": "雷锋网",
              "weibo_hot": "微博热搜", "zhihu_hot": "知乎热榜"}
@@ -234,9 +245,30 @@ def _apply_theme_record(theme, rec):
     if group:
         theme["group"] = group
         theme["meta"] = f"{group} · {theme.get('status') or '运行中'}"
-    if "alert" in rec:
-        theme["alert"] = bool(rec.get("alert"))
+    _apply_alert_fields(theme, rec)
     return theme
+
+
+def _apply_alert_fields(dest, src):
+    """把预警相关字段从记录拷到主题（缺省不覆盖）。"""
+    if "alert" in src:
+        dest["alert"] = bool(src.get("alert"))
+    for k in _ALERT_KEYS:
+        if k not in src:
+            continue
+        val = src.get(k)
+        if k == "alertSources":
+            if isinstance(val, list):
+                dest[k] = [str(x).strip() for x in val if str(x).strip()]
+            elif val:
+                dest[k] = [x.strip() for x in re.split(r"[,，、]", str(val)) if x.strip()]
+            else:
+                dest[k] = ["全部"]
+        elif isinstance(val, str):
+            dest[k] = val.strip()
+        else:
+            dest[k] = val
+    return dest
 
 
 def _new_theme_from_record(rec, tid):
@@ -324,13 +356,17 @@ def _save_theme(body):
         "alert": bool(body.get("alert")),
         "update_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    _apply_alert_fields(rec, body)
     rows = _read_themes_file()
     if tid:
         rec["id"] = tid
         found = False
         for i, r in enumerate(rows):
             if str(r.get("id") or "") == tid:
-                rec["create_time"] = r.get("create_time") or rec["update_time"]
+                merged = dict(r)
+                merged.update(rec)
+                merged["create_time"] = r.get("create_time") or rec["update_time"]
+                rec = merged
                 rows[i] = rec
                 found = True
                 break
@@ -461,21 +497,15 @@ def _overview():
     trend_days = []
     for i in range(6, -1, -1):
         trend_days.append(trend_map.get(str(since + dt.timedelta(days=i)), 0))
-    attn = sorted(
-        [r for r in rows if r.get("sentiment_label") == "负面"],
-        key=lambda r: r.get("publish_time") or dt.datetime.min, reverse=True)[:5]
+    attention, alert_count = _attention_alerts()
     return {
         "total": n,
         "today_add": today_n,
-        "alert_count": neg,
+        "alert_count": alert_count,
         "positive_ratio": round(pos / total * 100, 1),
         "emotion": {"pos": pos, "neu": neu, "neg": neg},
         "trend_7d": trend_days,
-        "attention": [{
-            "id": a["id"], "title": a["title"],
-            "meta": f"{SRC_NAME.get(a['source'], a['source'])} · {_rel_time(a['publish_time'])} · 负面",
-            "topic": _assign_topic(a),
-        } for a in attn],
+        "attention": attention,
     }
 
 
@@ -541,6 +571,176 @@ def _metrics(scope=None):
         },
         "source": source,
     }
+
+
+def _split_alert_words(val):
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    s = (val or "").strip()
+    if not s:
+        return []
+    return [x for x in re.split(r"[,，、|;｜\s]+", s) if x]
+
+
+def _theme_scan_words(theme):
+    """打开预警且填了预警词则用预警词，否则用主题关键词（内置主题开箱可出苗头）。"""
+    if theme.get("alert"):
+        words = _split_alert_words(theme.get("alertWords"))
+        if words:
+            return words
+    return list(theme.get("keywords") or [])
+
+
+def _article_match_text(row, match_mode):
+    title = row.get("title") or ""
+    content = row.get("content") or ""
+    if match_mode == "按标题":
+        return title
+    if match_mode == "按正文":
+        return content
+    return title + " " + content
+
+
+def _words_hit(text, words):
+    if not words or not text:
+        return False
+    tl = text.lower()
+    return any(w.lower() in tl for w in words if w)
+
+
+def _crisis_hints():
+    if _insight is not None:
+        hints = getattr(_insight, "_CRISIS_HINTS", None)
+        if hints:
+            return hints
+    return _CRISIS_HINTS
+
+
+def _volume_is_spike(trend):
+    if _insight is not None and hasattr(_insight, "_is_volume_spike"):
+        try:
+            return bool(_insight._is_volume_spike(trend))
+        except Exception:
+            pass
+    if not isinstance(trend, list) or len(trend) < 4:
+        return False
+    counts = []
+    for t in trend:
+        try:
+            counts.append(int((t or {}).get("count") or 0))
+        except (TypeError, ValueError):
+            counts.append(0)
+    early = counts[:-2]
+    late = counts[-2:]
+    early_avg = sum(early) / max(1, len(early))
+    late_avg = sum(late) / max(1, len(late))
+    if early_avg <= 0:
+        return late_avg >= 8
+    return late_avg >= _SPIKE_RATIO * early_avg
+
+
+def _latest_row(rows):
+    sample = None
+    for r in rows:
+        if sample is None or (r.get("publish_time") or dt.datetime.min) > (sample.get("publish_time") or dt.datetime.min):
+            sample = r
+    return sample
+
+
+def _attention_alerts():
+    """按主题扫描苗头：预警词/关键词 + 负面 + 近 7 日声量异常。无 LLM。
+
+    返回 (attention列表, 预警+危机条数)。列表按 危机>预警>观察，最多 _ATTN_LIMIT 条。
+    """
+    since = dt.date.today() - dt.timedelta(days=6)
+    hints = _crisis_hints()
+    items = []
+    for theme in THEMES:
+        tid = theme.get("id")
+        rows = [r for r in ARTICLES if _assign_topic(r) == tid]
+        if not rows:
+            continue
+        metrics = _metrics("topic:" + tid)
+        emo = metrics.get("emotion") or {}
+        try:
+            neg_ratio = float(emo.get("neg_ratio") or 0)
+        except (TypeError, ValueError):
+            neg_ratio = 0.0
+        spike = _volume_is_spike(metrics.get("trend"))
+        words = _theme_scan_words(theme)
+        match_mode = theme.get("alertMatch") or "全文"
+        sensitive_only = (theme.get("alertContent") or "") == "敏感"
+
+        recent = [r for r in rows if r.get("publish_time") and r["publish_time"].date() >= since]
+        recent_neg = [r for r in recent if r.get("sentiment_label") == "负面"]
+        pool = recent_neg if sensitive_only else recent
+
+        scan_pool = recent_neg
+        if sensitive_only:
+            scan_pool = [r for r in pool if r.get("sentiment_label") == "负面"]
+        hit_rows = []
+        if words:
+            for r in scan_pool:
+                if _words_hit(_article_match_text(r, match_mode), words):
+                    hit_rows.append(r)
+        crisis_rows = []
+        for r in recent_neg:
+            blob = (r.get("title") or "") + " " + (r.get("content") or "")
+            if any(k in blob for k in hints):
+                crisis_rows.append(r)
+
+        word_hit = bool(hit_rows)
+        high_neg = neg_ratio >= _NEG_RATIO_CRISIS
+        has_recent_neg = bool(recent_neg)
+        if not (word_hit or spike or high_neg or crisis_rows or has_recent_neg):
+            continue
+
+        reasons = []
+        if (spike and high_neg) or crisis_rows:
+            level = "危机"
+            if spike and high_neg:
+                reasons.append(f"近 7 日声量末段明显高于前期，且负面占比 {neg_ratio:.1f}%")
+            elif spike:
+                reasons.append("近 7 日声量末段明显高于前期")
+            if high_neg and not (spike and high_neg):
+                reasons.append(f"负面占比 {neg_ratio:.1f}%")
+            if crisis_rows:
+                reasons.append("近期负面命中投诉/召回/监管等危机词")
+            if word_hit and "预警词" not in "".join(reasons):
+                reasons.append("预警词/关键词命中近期负面")
+        elif spike or word_hit:
+            level = "预警"
+            if spike:
+                reasons.append("近 7 日声量末段明显高于前期")
+            if word_hit:
+                reasons.append("预警词/关键词命中近期负面")
+            if high_neg:
+                reasons.append(f"负面占比 {neg_ratio:.1f}%")
+        elif has_recent_neg:
+            level = "观察"
+            reasons.append(f"近 7 日有 {len(recent_neg)} 条负面，尚未出现声量异常")
+        else:
+            continue
+
+        sample = _latest_row(hit_rows or crisis_rows or recent_neg)
+        src_name = SRC_NAME.get((sample or {}).get("source"), (sample or {}).get("source") or "")
+        when = _rel_time(sample["publish_time"]) if sample else ""
+        title = (sample.get("title") if sample else None) or theme.get("name") or ""
+        items.append({
+            "id": (sample or {}).get("id") or tid,
+            "topic": tid,
+            "topic_name": theme.get("name") or "",
+            "title": title,
+            "level": level,
+            "reasons": reasons[:3],
+            "suggested_template": "crisis" if level == "危机" else "daily",
+            "meta": " · ".join(x for x in [theme.get("name") or "", src_name, when, level] if x),
+        })
+
+    order = {"危机": 0, "预警": 1, "观察": 2}
+    items.sort(key=lambda x: (order.get(x["level"], 9), x.get("topic_name") or ""))
+    alert_count = sum(1 for x in items if x["level"] in ("预警", "危机"))
+    return items[:_ATTN_LIMIT], alert_count
 
 
 def _topics():
@@ -653,7 +853,7 @@ def _insight_emotion():
 
 
 def _sample_feed_from_rows(rows):
-    """分层采样：负面/正面/中性各取若干，带上来源供模型引用。"""
+    """分层抽样：负面/正面/中性各取若干，带上 id/来源/链接供模型引用并核验。"""
     ordered = sorted(rows, key=lambda r: r.get("publish_time") or dt.datetime.min)
     neg = [r for r in ordered if r.get("sentiment_label") == "负面"]
     pos = [r for r in ordered if r.get("sentiment_label") == "正面"]
@@ -661,10 +861,12 @@ def _sample_feed_from_rows(rows):
     sample = (neg[-12:] + pos[-8:] + neu[-12:])
     sample.sort(key=lambda r: r.get("publish_time") or dt.datetime.min)
     return [{
+        "id": r.get("id"),
         "title": r.get("title"),
         "content": r.get("content"),
         "publish_time": str(r.get("publish_time") or ""),
         "source": SRC_NAME.get(r.get("source"), r.get("source") or ""),
+        "url": r.get("url") or "",
         "sentiment": {"label": r.get("sentiment_label", "中性")},
     } for r in sample]
 
@@ -681,8 +883,21 @@ def _metrics_text(scope=None):
     )
 
 
+def _scope_name(scope):
+    if not scope:
+        return "全部"
+    if scope.startswith("topic:"):
+        tid = scope[6:]
+        t = next((x for x in THEMES if x.get("id") == tid), None)
+        return t["name"] if t else tid
+    if scope.startswith("event:"):
+        names = {"e1": "美国关税", "e2": "某品牌召回传播"}
+        return names.get(scope[6:], scope[6:])
+    return scope
+
+
 def _insight_sixdim(scope=None):
-    """调用 LLM 对当前范围（主题/事件）文章做「六维舆情分析」。"""
+    """调用 LLM 对当前范围（主题/事件）文章做「六维舆情分析」，并附可核验推理依据。"""
     if not _insight:
         return {"available": False, "error": "insight_llm 模块未加载"}
     if not os.environ.get("LLM_API_KEY"):
@@ -691,8 +906,32 @@ def _insight_sixdim(scope=None):
     if not scoped:
         return {"available": False, "error": "当前主题/事件下暂无舆情数据，无法生成六维分析"}
     feed = _sample_feed_from_rows(scoped)
-    res = _insight.summarize_sixdimensions(feed, retries=2)
+    metrics = _metrics(scope)
+    metrics_text = _metrics_text(scope)
+    res = _insight.summarize_sixdimensions(feed, retries=2, metrics_text=metrics_text)
     if res.get("six_dimensions"):
+        n_neg = sum(1 for x in feed if (x.get("sentiment") or {}).get("label") == "负面")
+        n_pos = sum(1 for x in feed if (x.get("sentiment") or {}).get("label") == "正面")
+        n_neu = sum(1 for x in feed if (x.get("sentiment") or {}).get("label") == "中性")
+        res["basis"] = _insight.build_basis(
+            res["six_dimensions"],
+            res.get("evidence") or [],
+            feed,
+            metrics,
+            {
+                "scope": scope or "",
+                "scope_name": _scope_name(scope),
+                "total": len(scoped),
+                "sampled": len(feed),
+                "sample_strategy": (
+                    f"分层抽样：负面 {n_neg} 条、正面 {n_pos} 条、中性 {n_neu} 条"
+                    f"（上限 负面12 / 正面8 / 中性12）"
+                ),
+                "model": os.environ.get("LLM_MODEL") or "",
+                "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            },
+        )
+        res.pop("evidence", None)
         print("[insight-sixdim] 六维分析成功")
     else:
         print(f"[insight-sixdim] 六维分析失败：{res.get('error')}")

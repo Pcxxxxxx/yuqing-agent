@@ -29,9 +29,12 @@ const state = {
   showAllArticles: false, // 文章明细是否展开全部
   sixdimData: null, // LLM 六维舆情分析结果（当前 scope）
   sixdimLoading: false,
+  sixdimBasis: null, // 推理依据（统计 + 核验后的原文）
   metricsData: null, // 六维报告真实指标（声量趋势/情感分布/来源构成）
   sixdimScope: null, // 当前六维报告范围（topic:<id> 或 event:<id>）
-  sixdimCache: {}, // 各 scope 的六维结果缓存（切换页面不丢）
+  sixdimCache: {}, // 各 scope 的 { six_dimensions, basis }
+  basisOpen: false,
+  basisFocus: null, // 抽屉定位到的字段路径，如 emotion.emotion_shift
   reportData: null, // 舆情研判分析报告（markdown）
   reportLoading: false,
   reportCache: {}, // 各 scope 的报告缓存（区分生成/查看/重新生成）
@@ -48,6 +51,12 @@ function emptyEventForm() {
     exclude: "",
   };
 }
+
+const ALERT_FORM_KEYS = [
+  "alert", "alertName", "alertWords", "alertSources", "alertContent",
+  "alertMatch", "alertChannel", "alertWeekend", "alertMerge", "alertDedup",
+  "alertTime", "alertInterval", "alertIntervalHours",
+];
 
 function emptyPlanForm() {
   return {
@@ -69,6 +78,19 @@ function emptyPlanForm() {
     alertInterval: "实时预警",
     alertIntervalHours: "1小时",
   };
+}
+
+function pickAlertFields(src) {
+  const d = emptyPlanForm();
+  const out = {};
+  ALERT_FORM_KEYS.forEach((k) => {
+    if (src[k] == null || src[k] === "") out[k] = d[k];
+    else out[k] = src[k];
+  });
+  out.alert = !!src.alert;
+  if (Array.isArray(src.alertWords)) out.alertWords = src.alertWords.filter(Boolean).join(",");
+  if (!Array.isArray(out.alertSources) || !out.alertSources.length) out.alertSources = ["全部"];
+  return out;
 }
 
 // 数据由后端(server.py)从 agent_article 实时提供；启动时 loadData() 拉取
@@ -101,7 +123,7 @@ async function loadData() {
       exclude: t.exclude || [],
       group: t.group || ((t.meta || "").split("·")[0] || "").trim(),
       source_only: t.source_only || "",
-      alert: !!t.alert,
+      ...pickAlertFields(t),
     }));
     articles = ar.data || [];
     hotWords = hot.data || [];
@@ -115,14 +137,14 @@ async function loadData() {
   }
 }
 
-function toast(msg) {
+function toast(msg, ms) {
   const el = $("#toast");
   el.textContent = msg;
   el.hidden = false;
   clearTimeout(toast._t);
   toast._t = setTimeout(() => {
     el.hidden = true;
-  }, 1800);
+  }, ms || 1800);
 }
 
 function escapeHtml(s) {
@@ -146,8 +168,26 @@ function filteredArticles() {
   });
 }
 
+function applySixdimCached(scope) {
+  const c = state.sixdimCache[scope];
+  if (!c) {
+    state.sixdimData = null;
+    state.sixdimBasis = null;
+    return;
+  }
+  if (c.six_dimensions) {
+    state.sixdimData = c.six_dimensions;
+    state.sixdimBasis = c.basis || null;
+  } else {
+    state.sixdimData = c;
+    state.sixdimBasis = c.basis || null;
+  }
+}
+
 function setModule(mod) {
   state.module = mod;
+  state.basisOpen = false;
+  state.basisFocus = null;
   if (mod === "monitor") state.monitorView = "list";
   if (mod === "event") state.eventMode = "list";
   if (mod === "assistant" && !state.assistMessages.length) {
@@ -158,6 +198,26 @@ function setModule(mod) {
     loadSentimentResult();
   }
   render();
+}
+
+/** 工作台苗头 → 该主题分析洞察（不直接调大模型） */
+function openTopicInsightForAlert(topicId, suggestedTemplate) {
+  if (!topicId) return;
+  if (state.sixdimLoading) {
+    toast("六维分析生成中，请稍候再切换主题");
+    return;
+  }
+  state.topicId = topicId;
+  state.module = "monitor";
+  state.monitorView = "insight";
+  state.editingTopicId = null;
+  state.sixdimScope = "topic:" + topicId;
+  applySixdimCached(state.sixdimScope);
+  loadMetrics();
+  render();
+  const names = { crisis: "突发事件舆情应对方案", daily: "日常/定期舆情应对方案" };
+  const label = names[suggestedTemplate] || "应对方案";
+  toast(`已进入分析洞察。规则建议「${label}」，请先生成六维再点生成应对方案`, 3600);
 }
 
 /** 切换监测主题。resetView=true 时强制回数据列表；否则保留 list/insight/manage */
@@ -176,8 +236,10 @@ function switchMonitorTopic(topicId, resetView = false) {
   }
   if (state.monitorView === "insight") {
     state.sixdimScope = "topic:" + state.topicId;
-    state.sixdimData = state.sixdimCache[state.sixdimScope] || null;
+    applySixdimCached(state.sixdimScope);
     loadMetrics();
+  } else {
+    state.basisOpen = false;
   }
   render();
 }
@@ -223,11 +285,11 @@ function openPlanEdit(topicId) {
   state.topicId = topicId;
   state.planForm = {
     ...emptyPlanForm(),
+    ...pickAlertFields(t),
     name: t.name || "",
     group: group || "科技数码",
     keywords: joinTopicWords(t.keywords) || (t.source_only ? t.name : ""),
     exclude: joinTopicWords(t.exclude),
-    alert: !!t.alert,
   };
   state.planChat = [];
   render();
@@ -369,6 +431,13 @@ function optGroup(attr, options, current, multi = false) {
 }
 
 function render() {
+  const insightVisible =
+    (state.module === "monitor" && state.monitorView === "insight") ||
+    (state.module === "event" && state.eventMode === "result");
+  if (!insightVisible) {
+    state.basisOpen = false;
+    state.basisFocus = null;
+  }
   const scrollMap = {};
   document.querySelectorAll("[data-scroll-key]").forEach((el) => {
     scrollMap[el.dataset.scrollKey] = el.scrollTop;
@@ -399,6 +468,7 @@ function render() {
   else if (state.module === "settings") shell.innerHTML = renderSettings();
 
   bind();
+  syncBasisDrawer();
   if (state.modal) openModal(state.modal);
 
   document.querySelectorAll("[data-scroll-key]").forEach((el) => {
@@ -412,6 +482,7 @@ function renderOverview() {
     total: 0, today_add: 0, alert_count: 0, positive_ratio: 0,
     emotion: { pos: 0, neu: 0, neg: 0 }, trend_7d: [], attention: [],
   };
+  const attn = ov.attention || [];
   const emo = ov.emotion;
   const emoTotal = Math.max(1, (emo.pos || 0) + (emo.neu || 0) + (emo.neg || 0));
   const negPct = Math.round(((emo.neg || 0) / emoTotal) * 100);
@@ -467,26 +538,41 @@ function renderOverview() {
     <section class="panel">
       <header class="panel__head">
         <h3>需关注信息</h3>
-        <button type="button" class="btn-ghost" data-go="monitor">查看更多</button>
+        <div class="panel__head-right">
+          <span class="muted">${ov.alert_count ? `${ov.alert_count} 条预警/危机` : "暂无预警/危机"}</span>
+          <button type="button" class="btn-ghost" data-go="monitor">查看更多</button>
+        </div>
       </header>
       <div class="panel__body">
         <ul class="attn-list">
           ${
-            ov.attention.length
-              ? ov.attention
-                  .map(
-                    (a) => `<li data-go="monitor" data-topic="${a.topic}">
-                <i class="dot dot--neg"></i>
-                <div>
+            attn.length
+              ? attn
+                  .map((a) => {
+                    const level = a.level || "观察";
+                    const reasons = (a.reasons || []).map((r) => `<li>${escapeHtml(r)}</li>`).join("");
+                    const tpl = a.suggested_template || "daily";
+                    return `<li data-go="monitor" data-topic="${escapeHtml(a.topic || "")}">
+                <i class="dot ${level === "危机" ? "dot--neg" : level === "预警" ? "dot--warn" : "dot--neu"}"></i>
+                <div class="attn__body">
+                  <div class="attn__top">
+                    <span class="attn-badge attn-badge--${level}">${escapeHtml(level)}</span>
+                    <span class="attn__topic">${escapeHtml(a.topic_name || "")}</span>
+                  </div>
                   <div class="attn__title">${escapeHtml(a.title)}</div>
-                  <div class="attn__meta">${escapeHtml(a.meta)}</div>
+                  <div class="attn__meta">${escapeHtml(a.meta || "")}</div>
+                  ${reasons ? `<ul class="attn__reasons">${reasons}</ul>` : ""}
+                  <div class="attn__actions">
+                    <button type="button" class="btn-ghost attn-plan-btn" data-open-insight="${escapeHtml(a.topic || "")}" data-template="${escapeHtml(tpl)}">生成应对方案</button>
+                  </div>
                 </div>
-              </li>`
-                  )
+              </li>`;
+                  })
                   .join("")
-              : `<li><div class="attn__title">暂无负面信息</div></li>`
+              : `<li><div class="attn__title">暂无苗头信号</div></li>`
           }
         </ul>
+        <p class="attn-disclaimer">基于关键词与统计异常，非社交链预测。</p>
       </div>
     </section>
     <section class="panel">
@@ -1129,9 +1215,12 @@ function renderActions(acts) {
         </div>`;
       }).join("")
     : `<div class="action-item"><div class="action-item__left"><span class="action-text muted">生成六维分析后，这里会显示模型给出的建议优先行动。</span></div></div>`;
+  const actionBasis = state.sixdimData
+    ? `<button type="button" class="metric-link" data-open-basis="actions">查看行动依据</button>`
+    : "";
   return `
   <div class="action-panel">
-    <div class="action-panel__title">建议优先行动</div>
+    <div class="action-panel__title">建议优先行动 ${actionBasis}</div>
     <div class="action-list">${list}</div>
   </div>`;
 }
@@ -1446,8 +1535,13 @@ async function generatePlan(templateId) {
 
 async function generateSixdim() {
   const requestScope = state.sixdimScope;
+  delete state.sixdimCache[requestScope];
+  delete state.reportCache[requestScope];
+  delete state.planCache[requestScope];
   state.sixdimLoading = true;
   state.sixdimData = null;
+  state.sixdimBasis = null;
+  state.basisOpen = false;
   render();
   toast("正在调用大模型生成六维分析，约需数十秒…");
   try {
@@ -1456,8 +1550,11 @@ async function generateSixdim() {
     const d = r.data || {};
     const result = d.six_dimensions || null;
     if (result) {
-      state.sixdimCache[requestScope] = result; // 缓存，切换页面不丢
-      if (state.sixdimScope === requestScope) state.sixdimData = result;
+      state.sixdimCache[requestScope] = { six_dimensions: result, basis: d.basis || null };
+      if (state.sixdimScope === requestScope) {
+        state.sixdimData = result;
+        state.sixdimBasis = d.basis || null;
+      }
       toast("六维分析已生成");
     } else {
       const err = d.error || r.msg || (r.code ? `接口返回 code=${r.code}` : "未知原因");
@@ -1470,6 +1567,25 @@ async function generateSixdim() {
   render();
 }
 
+function fieldBasis(fieldKey) {
+  return (state.sixdimBasis && state.sixdimBasis.fields && state.sixdimBasis.fields[fieldKey]) || null;
+}
+
+function basisLinkHtml(fieldKey) {
+  if (!state.sixdimData) return "";
+  const info = fieldBasis(fieldKey);
+  const n = (info && info.evidence && info.evidence.length) || 0;
+  const status = (info && info.status) || "";
+  let extra = "";
+  if (status === "stats_conflict") extra = " · 与统计不一致";
+  else if (status === "unverified") extra = " · 含未核验";
+  else if (status === "no_evidence") extra = " · 无原文";
+  else if (status === "insufficient") extra = " · 证据不足";
+  else if (info && info.stats_match) extra = " · 与统计一致";
+  const txt = n ? `${n} 条依据` : "查看依据";
+  return `<button type="button" class="metric-link" data-open-basis="${fieldKey}">${txt}${extra}</button>`;
+}
+
 function renderSixdimCards(d) {
   const tagClass = (tag) => tag === "需关注" ? "tag--risk" : "tag--ai";
   const dim = (title, tag, rows) => `
@@ -1480,11 +1596,12 @@ function renderSixdimCards(d) {
       </div>
       ${rows}
     </div>`;
-  const row = (label, value, cls) => `
+  const row = (label, value, cls, fieldKey) => `
     <div class="metric-row">
       <span class="metric-label">${label}</span>
       <div class="metric-body">
         <div class="metric-value ${cls || ""}">${escapeHtml(value || "暂无足够数据")}</div>
+        ${fieldKey ? basisLinkHtml(fieldKey) : ""}
       </div>
     </div>`;
 
@@ -1516,24 +1633,26 @@ function renderSixdimCards(d) {
         <div class="stance-labels">
           <span>反对 ${stB}%</span><span>中立 ${stC}%</span><span>支持 ${stA}%</span><span>理中客 ${stD}%</span>
         </div>
+        <div class="metric-sub">AI 估计，情感分布以顶部统计为准</div>
+        ${basisLinkHtml("emotion.stance_split")}
       </div>
     </div>`;
 
   return `
   <div class="analysis-grid">
     ${dim("1. 基础信息", "AI 提取",
-      row("声量", b.volume, "metric-value--strong") + row("发声画像", b.voice_profile) + row("表达方式", b.expression))}
+      row("声量", b.volume, "metric-value--strong", "basic.volume") + row("发声画像", b.voice_profile, "", "basic.voice_profile") + row("表达方式", b.expression, "", "basic.expression"))}
     ${dim("2. 情感与态度", "需关注",
-      row("情感性质", e.sentiment) + row("态度强度", e.attitude_strength) +
-      stanceBlock + row("情感迁移", e.emotion_shift, "metric-value--alert"))}
+      row("情感性质", e.sentiment, "", "emotion.sentiment") + row("态度强度", e.attitude_strength, "", "emotion.attitude_strength") +
+      stanceBlock + row("情感迁移", e.emotion_shift, "metric-value--alert", "emotion.emotion_shift"))}
     ${dim("3. 叙事与框架", "AI 归纳",
-      row("议题框架", n.issue_frame) + row("符号隐喻", n.symbol_metaphor) + row("归因", n.attribution) + row("诉求", n.appeal))}
+      row("议题框架", n.issue_frame, "", "narrative.issue_frame") + row("符号隐喻", n.symbol_metaphor, "", "narrative.symbol_metaphor") + row("归因", n.attribution, "", "narrative.attribution") + row("诉求", n.appeal, "", "narrative.appeal"))}
     ${dim("4. 传播结构", "AI 提取",
-      row("传播路径", s.path) + row("意见领袖", s.kols) + row("平台情况", s.platform) + row("是否反转", s.reversal))}
+      row("传播路径", s.path, "", "spread.path") + row("意见领袖", s.kols, "", "spread.kols") + row("平台情况", s.platform, "", "spread.platform") + row("是否反转", s.reversal, "", "spread.reversal"))}
     ${dim("5. 行为倾向", "AI 研判",
-      row("线下行动", beh.offline_action) + row("消费影响", beh.consumption) + row("制度化参与", beh.institutional) + row("信息搜寻", beh.info_seeking))}
+      row("线下行动", beh.offline_action, "", "behavior.offline_action") + row("消费影响", beh.consumption, "", "behavior.consumption") + row("制度化参与", beh.institutional, "", "behavior.institutional") + row("信息搜寻", beh.info_seeking, "", "behavior.info_seeking"))}
     ${dim("6. 深层影响", "AI 归纳",
-      row("社会情绪", deep.social_emotion) + row("群体差异", deep.group_diff) + row("价值观冲突", deep.value_conflict) + row("历史类比", deep.historical_analogy))}
+      row("社会情绪", deep.social_emotion, "", "deep_impact.social_emotion") + row("群体差异", deep.group_diff, "", "deep_impact.group_diff") + row("价值观冲突", deep.value_conflict, "", "deep_impact.value_conflict") + row("历史类比", deep.historical_analogy, "", "deep_impact.historical_analogy"))}
   </div>`;
 }
 
@@ -1563,6 +1682,9 @@ function renderSixLayerInsight(scopeName, mode) {
         <span class="cockpit__badge badge--warning">AI 研判</span>
       </div>
       <div class="cockpit__actions">
+        ${state.sixdimData && !state.sixdimLoading
+          ? `<button type="button" class="btn btn--secondary" id="btn-generate-sixdim">重新生成六维</button>`
+          : ""}
         <button type="button" class="btn btn--secondary" id="btn-insight-export">${state.reportCache[state.sixdimScope || "all"] ? "查看研判报告" : "生成研判报告"}</button>
         <button type="button" class="btn btn--primary" id="btn-insight-plan"${
           state.sixdimLoading || (!state.sixdimData && !(state.planCache[state.sixdimScope || "all"] && state.planCache[state.sixdimScope || "all"].md))
@@ -1574,13 +1696,237 @@ function renderSixLayerInsight(scopeName, mode) {
 
     <div class="review-bar">
       <span class="review-bar__text">以下「情感迁移」「叙事框架」「深层影响」由 AI 归纳生成，涉及重大判断建议人工复核后使用。</span>
-      <button type="button" class="review-bar__link" id="btn-insight-basis">查看推理依据 →</button>
+      <button type="button" class="review-bar__link" id="btn-insight-basis"${state.sixdimData ? "" : " disabled"}>${state.sixdimData ? "查看推理依据 →" : "请先生成六维分析"}</button>
     </div>
 
     ${renderMiniCharts(state.metricsData)}
 
     ${sixdimBody}${renderActions(state.sixdimData ? state.sixdimData.actions : null)}
   </div>`;
+}
+
+const BASIS_DIM_GROUPS = [
+  { title: "1. 基础信息", keys: ["basic.volume", "basic.voice_profile", "basic.expression"] },
+  { title: "2. 情感与态度", keys: ["emotion.sentiment", "emotion.attitude_strength", "emotion.stance_split", "emotion.emotion_shift"] },
+  { title: "3. 叙事与框架", keys: ["narrative.issue_frame", "narrative.symbol_metaphor", "narrative.attribution", "narrative.appeal"] },
+  { title: "4. 传播结构", keys: ["spread.path", "spread.kols", "spread.platform", "spread.reversal"] },
+  { title: "5. 行为倾向", keys: ["behavior.offline_action", "behavior.consumption", "behavior.institutional", "behavior.info_seeking"] },
+  { title: "6. 深层影响", keys: ["deep_impact.social_emotion", "deep_impact.group_diff", "deep_impact.value_conflict", "deep_impact.historical_analogy"] },
+];
+
+function currentBasis() {
+  if (state.sixdimBasis) return state.sixdimBasis;
+  if (!state.sixdimData) return null;
+  return {
+    meta: {
+      scope: state.sixdimScope || "",
+      scope_name: currentScopeName(),
+      total: (state.metricsData && state.metricsData.total) || 0,
+      sampled: 0,
+      sample_strategy: "本次结果未附带抽样信息，请重新生成六维分析以获得原文依据",
+      model: "",
+      generated_at: "",
+      stats: state.metricsData || {},
+    },
+    fields: {},
+    actions: { items: state.sixdimData.actions || [], evidence: [] },
+    review: { no_evidence: [], unverified: [], stats_conflict: [] },
+  };
+}
+
+function openBasisDrawer(fieldKey) {
+  if (!state.sixdimData) {
+    toast("请先生成六维分析");
+    return;
+  }
+  state.basisOpen = true;
+  state.basisFocus = fieldKey || null;
+  render();
+}
+
+function closeBasisDrawer() {
+  state.basisOpen = false;
+  state.basisFocus = null;
+  render();
+}
+
+function sentimentToCode(s) {
+  if (s === "负面" || s === "neg") return "neg";
+  if (s === "正面" || s === "pos") return "pos";
+  return "neu";
+}
+
+function openBasisArticle(ev) {
+  if (!ev || ev.missing || !ev.title) {
+    toast("未找到对应原文，该引用未能核验");
+    return;
+  }
+  openModal({
+    title: ev.title,
+    source: ev.source || "",
+    time: ev.time || "",
+    sentiment: sentimentToCode(ev.sentiment),
+    summary: ev.quote ? `模型引用摘录：${ev.quote}` : (ev.title || "（暂无摘要）"),
+    url: ev.url || "",
+  });
+}
+
+function basisStatusLabel(status) {
+  return {
+    ok: "已核验",
+    unverified: "含未核验引用",
+    no_evidence: "无原文",
+    insufficient: "暂无足够数据",
+    stats_conflict: "与统计不一致",
+  }[status] || "";
+}
+
+function renderEvidenceCards(list, fieldKey) {
+  if (!list || !list.length) {
+    return `<p class="basis-empty">该字段暂无原文依据。若结论不是「暂无足够数据」，复核时请谨慎采信。</p>`;
+  }
+  return list.map((ev, i) => {
+    const warn = !ev.verified;
+    const tag = ev.missing ? "条目缺失" : (ev.verified ? "已核验" : "未核验");
+    const senti = ev.sentiment ? ` · ${escapeHtml(ev.sentiment)}` : "";
+    return `<article class="basis-card${warn ? " basis-card--warn" : ""}">
+      <div class="basis-card__meta">
+        <span>${escapeHtml(ev.source || "未知来源")} · ${escapeHtml(ev.time || "")}${senti}</span>
+        <span class="basis-card__tag${warn ? " is-warn" : ""}">${tag}</span>
+      </div>
+      <div class="basis-card__title">${escapeHtml(ev.title || "（无标题）")}</div>
+      ${ev.quote ? `<blockquote class="basis-quote">「${escapeHtml(ev.quote)}」</blockquote>` : ""}
+      <button type="button" class="metric-link" data-basis-article="${escapeHtml(fieldKey)}" data-basis-i="${i}">查看原文</button>
+    </article>`;
+  }).join("");
+}
+
+function renderBasisStatsLine(stats) {
+  const emo = (stats && stats.emotion) || {};
+  const src = ((stats && stats.source) || []).slice(0, 4)
+    .map((s) => `${s.source} ${s.count}`).join("、");
+  return `总量 ${stats && stats.total != null ? stats.total : 0} 条；负面 ${emo.neg || 0}（${emo.neg_ratio || 0}%） / 中性 ${emo.neu || 0}（${emo.neu_ratio || 0}%） / 正面 ${emo.pos || 0}（${emo.pos_ratio || 0}%）${src ? "；来源：" + src : ""}`;
+}
+
+function renderBasisDrawerHtml() {
+  const basis = currentBasis();
+  if (!basis) return "";
+  const meta = basis.meta || {};
+  const fields = basis.fields || {};
+  const review = basis.review || {};
+  const focus = state.basisFocus;
+  const conflictN = (review.stats_conflict || []).length;
+  const unverifiedN = (review.unverified || []).length;
+  const noneN = (review.no_evidence || []).length;
+
+  const groups = BASIS_DIM_GROUPS.map((g) => {
+    const infos = g.keys.map((k) => fields[k]).filter(Boolean);
+    const hasFocus = g.keys.includes(focus);
+    const open = hasFocus || infos.some((f) => f.expand) || g.title.indexOf("深层") >= 0 || g.title.indexOf("叙事") >= 0;
+    const rows = g.keys.map((k) => {
+      const f = fields[k];
+      if (!f) return "";
+      const focused = focus === k ? " is-focus" : "";
+      const st = basisStatusLabel(f.status);
+      const statsNote = f.stats_ref && f.stats_ref.length
+        ? (f.stats_match ? `<span class="basis-pill basis-pill--ok">与统计一致</span>` : (f.status === "stats_conflict" ? `<span class="basis-pill basis-pill--bad">与统计不一致</span>` : `<span class="basis-pill">对照顶部统计</span>`))
+        : "";
+      return `<section class="basis-field${focused}" data-basis-field="${k}">
+        <div class="basis-field__head">
+          <strong>${escapeHtml(f.label)}</strong>
+          ${st ? `<span class="basis-pill${f.status === "stats_conflict" || f.status === "unverified" ? " basis-pill--bad" : ""}">${st}</span>` : ""}
+          ${statsNote}
+        </div>
+        <p class="basis-claim">${escapeHtml(f.claim || "暂无足够数据")}</p>
+        ${renderEvidenceCards(f.evidence, k)}
+      </section>`;
+    }).join("");
+    return `<details class="basis-dim" ${open ? "open" : ""}>
+      <summary>${escapeHtml(g.title)}</summary>
+      ${rows || `<p class="basis-empty">请重新生成六维分析以加载字段依据。</p>`}
+    </details>`;
+  }).join("");
+
+  const actionOpen = focus === "actions";
+  const actionEvs = (basis.actions && basis.actions.evidence) || [];
+  const actionItems = (basis.actions && basis.actions.items) || [];
+  const actionList = actionItems.length
+    ? `<ul class="basis-action-list">${actionItems.map((a) => `<li><strong>${escapeHtml(a.title || "")}</strong> — ${escapeHtml(a.detail || "")}</li>`).join("")}</ul>`
+    : `<p class="basis-empty">暂无优先行动。</p>`;
+
+  const tech = [];
+  if (meta.model) tech.push(`模型 ${meta.model}`);
+  if (meta.generated_at) tech.push(`生成于 ${meta.generated_at}`);
+
+  return `
+  <div class="basis-mask" data-close-basis></div>
+  <aside class="basis-drawer" role="dialog" aria-label="推理依据">
+    <header class="basis-drawer__head">
+      <div>
+        <div class="basis-drawer__title">本次分析依据</div>
+        <div class="basis-drawer__sub">${escapeHtml(meta.scope_name || currentScopeName())}</div>
+      </div>
+      <button type="button" class="basis-close" data-close-basis aria-label="关闭">×</button>
+    </header>
+    <div class="basis-drawer__body" data-scroll-key="basis-drawer">
+      <div class="basis-meta">
+        <p>库内匹配 <strong>${meta.total != null ? meta.total : 0}</strong> 条，实际送入模型 <strong>${meta.sampled != null ? meta.sampled : 0}</strong> 条。</p>
+        <p class="muted">${escapeHtml(meta.sample_strategy || "")}</p>
+        <p class="basis-stats">${escapeHtml(renderBasisStatsLine(meta.stats))}</p>
+        <p class="muted">以上数字来自统计，非模型口述。</p>
+      </div>
+      ${conflictN ? `<div class="basis-alert">有 ${conflictN} 个字段与统计不一致，请以顶部图表为准。</div>` : ""}
+      ${unverifiedN || noneN ? `<div class="basis-alert basis-alert--soft">复核清单：无原文 ${noneN} · 含未核验 ${unverifiedN} · 与统计冲突 ${conflictN}</div>` : ""}
+      ${groups}
+      <details class="basis-dim" ${actionOpen ? "open" : ""}>
+        <summary>建议优先行动</summary>
+        <section class="basis-field${actionOpen ? " is-focus" : ""}" data-basis-field="actions">
+          ${actionList}
+          ${renderEvidenceCards(actionEvs, "actions")}
+        </section>
+      </details>
+      ${tech.length ? `<details class="basis-dim basis-dim--tech"><summary>技术信息</summary><p class="muted">${escapeHtml(tech.join(" · "))}</p></details>` : ""}
+    </div>
+  </aside>`;
+}
+
+function syncBasisDrawer() {
+  let root = document.getElementById("basis-drawer-root");
+  const prevBody = root && root.querySelector("[data-scroll-key='basis-drawer']");
+  const prevScroll = prevBody ? prevBody.scrollTop : 0;
+  if (!state.basisOpen) {
+    if (root) root.remove();
+    return;
+  }
+  if (!root) {
+    root = document.createElement("div");
+    root.id = "basis-drawer-root";
+    document.body.appendChild(root);
+  }
+  root.innerHTML = renderBasisDrawerHtml();
+  root.querySelectorAll("[data-close-basis]").forEach((el) => {
+    el.addEventListener("click", closeBasisDrawer);
+  });
+  root.querySelectorAll("[data-basis-article]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const key = btn.dataset.basisArticle;
+      const i = Number(btn.dataset.basisI);
+      const basis = currentBasis();
+      let ev = null;
+      if (key === "actions") ev = (((basis.actions || {}).evidence) || [])[i];
+      else ev = (((basis.fields || {})[key] || {}).evidence || [])[i];
+      openBasisArticle(ev);
+    });
+  });
+  const focus = state.basisFocus;
+  if (focus) {
+    const el = root.querySelector(`[data-basis-field="${focus}"]`);
+    if (el) el.scrollIntoView({ block: "center" });
+  } else {
+    const body = root.querySelector("[data-scroll-key='basis-drawer']");
+    if (body) body.scrollTop = prevScroll;
+  }
 }
 
 function renderEventResult() {
@@ -2095,6 +2441,8 @@ function openModal(type) {
   } else if (type && typeof type === "object" && type.title) {
     // 真实文章详情：展示摘要 + 原文链接
     const a = type;
+    const rawUrl = String(a.url || "").trim();
+    const safeUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : "";
     wrap.innerHTML = `
       <div class="modal">
         <h3>${escapeHtml(a.title)}</h3>
@@ -2103,10 +2451,12 @@ function openModal(type) {
         }">${sentLabel(a.sentiment)}</span></div>
         <p style="line-height:1.7;font-size:14px;">${escapeHtml(a.summary || "（暂无摘要）")}</p>
         <p>
-          <a href="${a.url}" target="_blank" rel="noopener"
+          ${safeUrl
+            ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener"
              style="display:inline-block;background:#1f6b5c;color:#fff;text-decoration:none;padding:9px 18px;border-radius:6px;font-size:14px;">
             查看原文 ↗
-          </a>
+          </a>`
+            : `<span class="muted">无原文链接</span>`}
         </p>
         <div class="modal__actions">
           <button type="button" class="btn-primary" data-close-modal>关闭</button>
@@ -2134,6 +2484,13 @@ function openModal(type) {
 }
 
 function bind() {
+  document.querySelectorAll("[data-open-insight]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openTopicInsightForAlert(btn.dataset.openInsight, btn.dataset.template);
+    });
+  });
   document.querySelectorAll("[data-go]").forEach((el) => {
     el.addEventListener("click", () => {
       if (state.sixdimLoading && el.dataset.topic && el.dataset.topic !== state.topicId) {
@@ -2150,8 +2507,11 @@ function bind() {
       state.monitorView = btn.dataset.view;
       if (btn.dataset.view === "insight") {
         state.sixdimScope = "topic:" + state.topicId;
-        state.sixdimData = state.sixdimCache[state.sixdimScope] || null;
+        applySixdimCached(state.sixdimScope);
         loadMetrics();
+      } else {
+        state.basisOpen = false;
+        state.basisFocus = null;
       }
       render();
     });
@@ -2242,7 +2602,8 @@ function bind() {
           body: JSON.stringify({
             id: state.editingTopicId || undefined,
             name: f.name, group: f.group, keywords: f.keywords,
-            exclude: f.exclude, alert: f.alert,
+            exclude: f.exclude,
+            ...pickAlertFields(f),
           }),
         }).then((x) => x.json());
         const d = r.data || {};
@@ -2354,7 +2715,7 @@ function bind() {
       state.eventId = btn.dataset.openEvent;
       state.eventMode = "result";
       state.sixdimScope = "event:" + btn.dataset.openEvent;
-      state.sixdimData = state.sixdimCache[state.sixdimScope] || null;
+      applySixdimCached(state.sixdimScope);
       loadMetrics();
       render();
     });
@@ -2376,7 +2737,14 @@ function bind() {
   const btnInsightScript = $("#btn-insight-script");
   if (btnInsightScript) btnInsightScript.onclick = () => toast("演示：已按 PRD 模板生成回应话术");
   const btnInsightBasis = $("#btn-insight-basis");
-  if (btnInsightBasis) btnInsightBasis.onclick = () => toast("演示：展示模型引用的原文与规则依据");
+  if (btnInsightBasis) btnInsightBasis.onclick = () => openBasisDrawer();
+  document.querySelectorAll("[data-open-basis]").forEach((el) => {
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openBasisDrawer(el.dataset.openBasis);
+    });
+  });
   const btnGenerateSixdim = $("#btn-generate-sixdim");
   if (btnGenerateSixdim) btnGenerateSixdim.onclick = generateSixdim;
   document.querySelectorAll("[data-insight-toast]").forEach((el) => {
@@ -2576,6 +2944,13 @@ $("#topnav").addEventListener("click", (e) => {
 
 // 主题切换用事件委托（#shell 节点不销毁，避免每次 render 重绑失败/缓存旧逻辑）
 $("#shell").addEventListener("click", (e) => {
+  const insightBtn = e.target.closest("[data-open-insight]");
+  if (insightBtn) {
+    e.preventDefault();
+    e.stopPropagation();
+    openTopicInsightForAlert(insightBtn.dataset.openInsight, insightBtn.dataset.template);
+    return;
+  }
   const jump = e.target.closest("[data-jump-list]");
   if (jump && jump.dataset.topic) {
     switchMonitorTopic(jump.dataset.topic, true);
@@ -2594,5 +2969,11 @@ $("#shell").addEventListener("click", (e) => {
 
 render();
 loadData();
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || !state.basisOpen) return;
+  if (document.getElementById("modal")) return;
+  closeBasisDrawer();
+});
 
 
